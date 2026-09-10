@@ -1,0 +1,5 @@
+<resources>
+    <string name="app_name">Memos Pocket</string>
+    <string name="notification_channel_name">Memo reminders</string>
+    <string name="notification_channel_description">Reminders synchronized from your Memos server</string>
+</resources>
