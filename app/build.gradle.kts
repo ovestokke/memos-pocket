@@ -4,6 +4,12 @@ plugins {
     id("org.jetbrains.kotlin.plugin.compose")
 }
 
+val appVersionName = providers.environmentVariable("MEMOS_POCKET_VERSION_NAME").orElse("0.2.0")
+val appVersionCode = providers.environmentVariable("MEMOS_POCKET_VERSION_CODE").map { value ->
+    value.toIntOrNull()?.takeIf { it > 0 }
+        ?: error("MEMOS_POCKET_VERSION_CODE must be a positive integer.")
+}.orElse(2000)
+
 val releaseSigningValues = mapOf(
     "storeFile" to providers.environmentVariable("MEMOS_POCKET_STORE_FILE").orNull,
     "storePassword" to providers.environmentVariable("MEMOS_POCKET_STORE_PASSWORD").orNull,
@@ -23,8 +29,8 @@ android {
         applicationId = "com.vstokke.memos"
         minSdk = 26
         targetSdk = 36
-        versionCode = 1
-        versionName = "0.1.0"
+        versionCode = appVersionCode.get()
+        versionName = appVersionName.get()
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables.useSupportLibrary = true
@@ -80,6 +86,7 @@ dependencies {
     implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.9.1")
     implementation("androidx.compose.foundation:foundation")
     implementation("androidx.compose.material3:material3")
+    implementation("androidx.compose.material:material-icons-extended")
     implementation("androidx.compose.ui:ui")
     implementation("androidx.compose.ui:ui-tooling-preview")
     implementation("androidx.work:work-runtime-ktx:2.10.1")

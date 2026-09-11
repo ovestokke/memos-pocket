@@ -29,8 +29,8 @@ fun MarkdownText(markdown: String) {
                 else -> sourceLine
             }
             val lineStyle = when {
-                headingLevel == 1 -> SpanStyle(fontFamily = FontFamily.SansSerif, fontWeight = FontWeight.Bold, fontSize = 24.sp)
-                headingLevel in 2..3 -> SpanStyle(fontFamily = FontFamily.SansSerif, fontWeight = FontWeight.Bold, fontSize = 20.sp)
+                headingLevel == 1 -> SpanStyle(fontWeight = FontWeight.SemiBold, fontSize = 24.sp)
+                headingLevel in 2..3 -> SpanStyle(fontWeight = FontWeight.SemiBold, fontSize = 20.sp)
                 headingLevel != null -> SpanStyle(fontWeight = FontWeight.Bold)
                 trimmed.startsWith("> ") -> SpanStyle(fontStyle = FontStyle.Italic)
                 else -> SpanStyle()

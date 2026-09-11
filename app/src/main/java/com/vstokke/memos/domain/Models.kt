@@ -45,6 +45,12 @@ data class Memo(
 
 data class MemoPage(val memos: List<Memo>, val nextPageToken: String?)
 
+data class Space(
+    val name: String,
+    val title: String,
+    val description: String,
+)
+
 data class MemoEdit(val content: String, val visibility: String, val reminderTime: Instant?)
 
 data class ReminderRecord(
@@ -57,6 +63,7 @@ data class NewMemo(
     val content: String,
     val reminderTime: Instant?,
     val visibility: String = "PRIVATE",
+    val space: String? = null,
 )
 
 data class CreatedMemoResult(

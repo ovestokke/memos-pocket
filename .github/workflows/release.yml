@@ -1,0 +1,120 @@
+name: Publish Android release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: android-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@v4
+
+      - name: Derive Android version from tag
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF_NAME" =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+            major="${BASH_REMATCH[1]}"
+            minor="${BASH_REMATCH[2]}"
+            patch="${BASH_REMATCH[3]}"
+          else
+            echo "Release tags must use vMAJOR.MINOR.PATCH." >&2
+            exit 1
+          fi
+          if (( minor > 999 || patch > 999 )); then
+            echo "MINOR and PATCH must be between 0 and 999." >&2
+            exit 1
+          fi
+          version_code=$((10#$major * 1000000 + 10#$minor * 1000 + 10#$patch))
+          if (( version_code < 1 || version_code > 2100000000 )); then
+            echo "Derived Android versionCode is outside the supported range." >&2
+            exit 1
+          fi
+          echo "VERSION_NAME=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+          echo "VERSION_CODE=$version_code" >> "$GITHUB_ENV"
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK packages
+        run: sdkmanager "platforms;android-36" "build-tools;36.0.0"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Restore release keystore
+        shell: bash
+        env:
+          KEYSTORE_BASE64: ${{ secrets.MEMOS_POCKET_KEYSTORE_BASE64 }}
+          STORE_PASSWORD: ${{ secrets.MEMOS_POCKET_STORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.MEMOS_POCKET_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.MEMOS_POCKET_KEY_PASSWORD }}
+        run: |
+          for name in KEYSTORE_BASE64 STORE_PASSWORD KEY_ALIAS KEY_PASSWORD; do
+            if [[ -z "${!name}" ]]; then
+              echo "Missing release-signing secret: $name" >&2
+              exit 1
+            fi
+          done
+          umask 077
+          printf '%s' "$KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/memos-pocket-release.jks"
+          test -s "$RUNNER_TEMP/memos-pocket-release.jks"
+
+      - name: Test, lint and build signed release APK
+        env:
+          MEMOS_POCKET_VERSION_NAME: ${{ env.VERSION_NAME }}
+          MEMOS_POCKET_VERSION_CODE: ${{ env.VERSION_CODE }}
+          MEMOS_POCKET_STORE_FILE: ${{ runner.temp }}/memos-pocket-release.jks
+          MEMOS_POCKET_STORE_PASSWORD: ${{ secrets.MEMOS_POCKET_STORE_PASSWORD }}
+          MEMOS_POCKET_KEY_ALIAS: ${{ secrets.MEMOS_POCKET_KEY_ALIAS }}
+          MEMOS_POCKET_KEY_PASSWORD: ${{ secrets.MEMOS_POCKET_KEY_PASSWORD }}
+        run: ./gradlew --no-daemon testDebugUnitTest lintDebug assembleRelease
+
+      - name: Verify and stage release assets
+        shell: bash
+        run: |
+          apk="app/build/outputs/apk/release/app-release.apk"
+          test -f "$apk"
+          apksigner="$(find "$ANDROID_SDK_ROOT/build-tools" -maxdepth 2 -type f -name apksigner | sort -V | tail -n 1)"
+          test -n "$apksigner"
+          "$apksigner" verify --verbose --print-certs "$apk"
+          mkdir -p dist
+          asset="dist/memos-pocket-${VERSION_NAME}.apk"
+          cp "$apk" "$asset"
+          (cd dist && sha256sum "memos-pocket-${VERSION_NAME}.apk" > "memos-pocket-${VERSION_NAME}.apk.sha256")
+          echo "APK_ASSET=$asset" >> "$GITHUB_ENV"
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: memos-pocket-${{ env.VERSION_NAME }}
+          path: |
+            ${{ env.APK_ASSET }}
+            ${{ env.APK_ASSET }}.sha256
+          if-no-files-found: error
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          gh release create "$GITHUB_REF_NAME"
+          "$APK_ASSET" "$APK_ASSET.sha256"
+          --verify-tag
+          --title "Memos Pocket ${VERSION_NAME}"
+          --generate-notes

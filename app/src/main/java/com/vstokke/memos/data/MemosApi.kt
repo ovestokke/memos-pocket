@@ -10,6 +10,7 @@ import com.vstokke.memos.domain.Memo
 import com.vstokke.memos.domain.NewMemo
 import com.vstokke.memos.domain.ReminderRecord
 import com.vstokke.memos.domain.ReminderTime
+import com.vstokke.memos.domain.Space
 import com.vstokke.memos.domain.User
 import okhttp3.HttpUrl
 import okhttp3.MediaType.Companion.toMediaType
@@ -52,6 +53,37 @@ class MemosApi(
         return parseJson(body) { root -> root.optBoolean("memoReminderTimeSupported", false) }
     }
 
+    fun listSpaces(account: Account): List<Space> {
+        val spaces = LinkedHashMap<String, Space>()
+        val seenTokens = mutableSetOf<String>()
+        var pageToken: String? = null
+        do {
+            val url = endpoint(account.baseUrl, "api/v1/spaces").newBuilder()
+                .addQueryParameter("pageSize", "1000")
+                .apply { pageToken?.let { addQueryParameter("pageToken", it) } }
+                .build()
+            val body = execute(account, url)
+            pageToken = parseJson(body) { root ->
+                val source = root.optJSONArray("spaces") ?: org.json.JSONArray()
+                for (index in 0 until source.length()) {
+                    val value = source.getJSONObject(index)
+                    val name = value.getString("name")
+                    if (!SPACE_NAME.matches(name)) throw JSONException("invalid space resource")
+                    spaces[name] = Space(
+                        name = name,
+                        title = value.getString("title"),
+                        description = value.optString("description"),
+                    )
+                }
+                root.optString("nextPageToken").ifBlank { null }
+            }
+            if (pageToken != null && !seenTokens.add(pageToken!!)) {
+                throw AppException(AppError.InvalidResponse)
+            }
+        } while (pageToken != null)
+        return spaces.values.sortedBy { it.title.lowercase() }
+    }
+
     fun listRecent(account: Account, limit: Int = 20): List<Memo> {
         val url = memoListUrl(account, limit, orderBy = "create_time desc")
         val body = execute(account, url)
@@ -86,11 +118,16 @@ class MemosApi(
 
     fun createMemo(account: Account, draft: NewMemo): CreatedMemoResult {
         if (draft.reminderTime != null && !account.supportsMemoReminderTime) throw AppException(AppError.UnsupportedReminder)
-        require(draft.visibility in listOf("PRIVATE", "PROTECTED", "PUBLIC"))
+        require(
+            draft.visibility in listOf("PRIVATE", "PROTECTED", "PUBLIC") ||
+                (draft.visibility == "SPACE" && draft.space?.matches(SPACE_NAME) == true),
+        )
+        draft.space?.let { require(SPACE_NAME.matches(it)) }
         val payload = JSONObject()
             .put("content", draft.content)
             .put("state", "NORMAL")
             .put("visibility", draft.visibility)
+        draft.space?.let { payload.put("space", it) }
         draft.reminderTime?.let { payload.put("reminderTime", ReminderTime.toServer(it)) }
 
         val body = execute(
@@ -106,8 +143,13 @@ class MemosApi(
         )
     }
 
-    fun listPage(account: Account, state: String = "NORMAL", pageToken: String? = null): MemoPage {
-        val body = execute(account, memoListUrl(account, 30, "pinned desc, create_time desc", pageToken, state))
+    fun listPage(
+        account: Account,
+        state: String = "NORMAL",
+        pageToken: String? = null,
+        space: String? = null,
+    ): MemoPage {
+        val body = execute(account, memoListUrl(account, 30, "pinned desc, create_time desc", pageToken, state, space))
         return parseJson(body) { MemoPage(parseMemos(it), it.optString("nextPageToken").ifBlank { null }) }
     }
 
@@ -160,14 +202,17 @@ class MemosApi(
         orderBy: String? = null,
         pageToken: String? = null,
         state: String = "NORMAL",
+        space: String? = null,
     ): HttpUrl {
         val creator = account.userName.replace("\\", "\\\\").replace("\"", "\\\"")
+        space?.let { require(SPACE_NAME.matches(it)) }
         return endpoint(account.baseUrl, "api/v1/memos").newBuilder()
             .addQueryParameter("pageSize", pageSize.toString())
             .addQueryParameter("state", state)
             .apply {
                 orderBy?.let { addQueryParameter("orderBy", it) }
-                addQueryParameter("filter", "creator == \"$creator\"")
+                if (space == null) addQueryParameter("filter", "creator == \"$creator\"")
+                else addQueryParameter("space", space)
                 pageToken?.let { addQueryParameter("pageToken", it) }
             }
             .build()
@@ -265,5 +310,6 @@ class MemosApi(
         val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
         val USER_NAME = Regex("^users/[^/]+$")
         val MEMO_NAME = Regex("^memos/[^/]+$")
+        val SPACE_NAME = Regex("^spaces/[^/]+$")
     }
 }

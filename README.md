@@ -1,18 +1,19 @@
 # Memos Pocket
 
-An unofficial Android client for [Memos](https://www.usememos.com/). This is the first implementation milestone of the full-app repair plan, **not a finished app**. See [the plan and web-parity matrix](fix-app-because-ai-sux.md) for implemented and remaining work.
+An unofficial Android client for [Memos](https://www.usememos.com/). The app is under active development.
 
-## Implemented in this milestone
+## Implemented
 
 - HTTPS server + personal access token login, with Keystore-encrypted credentials.
 - Paginated normal and archived feeds, pinned-first ordering, memo detail fetched independently of the feed.
+- Member-space discovery, space-scoped feeds, remembered space selection and space memo creation.
 - Create, edit, pin/unpin, archive/restore, copy link/content and confirmed delete without `force`.
 - Precise update masks, best-effort concurrent-edit detection, retained drafts on rotation/network errors, explicit server reload on conflict.
 - Compact Compose screens adapted from actual web-Memos colors and layouts, drawer/sidebar navigation, persistent system/light/dark theme.
 - Settings with account information, confirmed disconnect, Android notification/channel and exact-alarm controls, sync/alarm diagnostics and an explicit test notification.
 - Capability-controlled server reminders, local delivery ledger, stale reminder cleanup and background reconciliation.
 
-Still required: task toggles, move/spaces, attachments, comments/relations/reactions, full sharing, search/filters/calendar/views, richer Markdown/editor support and remaining user preferences. No placeholder menu items pretend these are implemented. Drafts survive rotation but are not persisted across process death.
+Still required: task toggles, moving existing memos between spaces, attachments, comments/relations/reactions, full sharing, search/filters/calendar/views, richer Markdown/editor support and remaining user preferences. Drafts survive rotation but are not persisted across process death.
 
 ## Build
 
@@ -26,16 +27,26 @@ JAVA_HOME=/usr/lib/jvm/java-17-openjdk ANDROID_HOME="$HOME/Android/Sdk" \
 Artifacts:
 
 - Debug APK: `app/build/outputs/apk/debug/app-debug.apk`
-- Unsigned release APK: `app/build/outputs/apk/release/app-release-unsigned.apk`
+- Release APK: `app/build/outputs/apk/release/app-release.apk` when signing is configured; otherwise `app-release-unsigned.apk`
 - Release bundle: `app/build/outputs/bundle/release/app-release.aab`
 
 The namespace and application ID are **`com.vstokke.memos`**. App name remains Memos Pocket.
 
-The old `com.vstokke.memopocket` installation cannot be updated by this package. It has a separate sandbox, credentials, Keystore, permissions and delivery history. No credentials are exported or copied. A controlled transition requires user login and permissions in the new app, a decision about initial 24-hour catch-up, and disabling old reminder scheduling to avoid duplicate notifications. The existing tablet app and login have not been changed; no installation was performed.
+The old `com.vstokke.memopocket` installation cannot be updated by this package. It has a separate sandbox, credentials, Keystore, permissions and delivery history. No credentials are exported or copied.
+
+## Install and update with Obtainium
+
+Stable APKs are published through [GitHub Releases](https://github.com/ovestokke/memos-pocket/releases). Add this repository URL to Obtainium:
+
+`https://github.com/ovestokke/memos-pocket`
+
+The first production-signed APK cannot update a debug-signed development install. Uninstall the debug app once, install the release through Obtainium, and sign in again. Later releases update in place.
+
+See [`docs/releasing.md`](docs/releasing.md) for signing-key setup and the tag-based release procedure.
 
 ## Release signing
 
-Permanent signing has not been created or changed. The build accepts either all or none of:
+The build accepts either all or none of:
 
 - `MEMOS_POCKET_STORE_FILE`
 - `MEMOS_POCKET_STORE_PASSWORD`
@@ -58,7 +69,7 @@ WorkManager requests approximately 15-minute sync intervals, subject to Android/
 
 ## API and safety
 
-Implemented routes are `/api/v1/auth/me`, `/api/v1/instance/profile`, paginated `/api/v1/memos`, and GET/PATCH/DELETE `/api/v1/memos/{id}`. The sibling proto, handlers and generated gateway were read without modification.
+Implemented routes are `/api/v1/auth/me`, `/api/v1/instance/profile`, `/api/v1/spaces`, paginated `/api/v1/memos`, and GET/PATCH/DELETE `/api/v1/memos/{id}`. Space feeds use server scope when available and verify placement client-side for compatibility.
 
 JSON fields use lower camel case. REST `updateMask` query values use proto paths such as `content,update_time,reminder_time`: grpc-gateway does not apply JSON FieldMask camel-case conversion to this query parameter. Clearing a reminder includes `reminder_time` in the mask and omits its timestamp. Content-only mutations never echo attachments, relations, placement or unknown JSON fields.
 
@@ -70,4 +81,4 @@ TLS verification, redirect blocking, HTTPS-only input, backup exclusion and priv
 
 ## Validation
 
-40 API/domain/repository/ViewModel tests currently pass. A real-SQLite instrumentation regression test for interrupted batches and submillisecond timestamps compiles but has not yet run on a device. Lint and debug/release APK/AAB builds pass; bounded logs are in `validation/`. Repository tests use mocks, and ViewModel tests do not exercise Compose layout. The plan records pending live CRUD, database/alarm instrumentation, actual notification delivery, installation transition and visual/device acceptance. Building is not proof of those behaviors.
+49 API/domain/repository/ViewModel tests currently pass. A real-SQLite instrumentation regression test for interrupted batches and submillisecond timestamps compiles but has not yet run on a device. Lint and debug/release APK/AAB builds pass; bounded logs are in `validation/`. Repository tests use mocks, and ViewModel tests do not exercise Compose layout. The plan records pending live CRUD, database/alarm instrumentation, actual notification delivery, installation transition and visual/device acceptance. Building is not proof of those behaviors.

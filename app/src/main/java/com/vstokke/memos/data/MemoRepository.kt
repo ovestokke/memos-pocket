@@ -22,12 +22,17 @@ class MemoRepository(
     val feed: StateFlow<List<Memo>> = mutableFeed
     private val mutableAccount = MutableStateFlow(credentials.load()?.summary())
     val accountSummary: StateFlow<AccountSummary?> = mutableAccount
+    private val mutableSpaces = MutableStateFlow<List<Space>?>(null)
+    val spaces: StateFlow<List<Space>?> = mutableSpaces
     private var feedState = "NORMAL"
+    private var feedSpace: String? = null
     private var nextPage: String? = null
     private val seenPages = mutableSetOf<String>()
     val hasMore = MutableStateFlow(false)
 
     fun account(): Account? = credentials.load()
+    fun selectedSpace(): String? = credentials.selectedSpace()
+    fun saveSelectedSpace(name: String?) = credentials.saveSelectedSpace(name)
 
     private suspend fun <T> locked(block: () -> T): T = mutex.withLock { withContext(Dispatchers.IO) { block() } }
 
@@ -42,6 +47,9 @@ class MemoRepository(
             reminders.clearDiagnostics()
             database.clearAll()
             mutableFeed.value = emptyList()
+            mutableSpaces.value = null
+            feedSpace = null
+            credentials.saveSelectedSpace(null)
             resetPages()
         }
         credentials.save(account)
@@ -60,7 +68,8 @@ class MemoRepository(
         mutableAccount.value = account.summary()
         // Complete cleanup before any feed request can fail. Do not cancel the executing worker.
         if (!supported) reminders.clearReminders()
-        val page = api.listPage(account, feedState)
+        mutableSpaces.value = api.listSpaces(account)
+        val page = scopedPage(account, feedState, pageToken = null, space = feedSpace)
         if (supported) reminders.reconcile(api.listAllReminders(account))
         resetPages()
         nextPage = page.nextPageToken
@@ -70,17 +79,23 @@ class MemoRepository(
         account
     }
 
-    suspend fun page(expected: AccountSummary, archive: Boolean, more: Boolean = false) = locked {
+    suspend fun page(
+        expected: AccountSummary,
+        archive: Boolean,
+        more: Boolean = false,
+        space: String? = null,
+    ) = locked {
         val account = requireAccount(expected)
         val target = if (archive) "ARCHIVED" else "NORMAL"
-        val token = if (more && target == feedState) nextPage ?: return@locked else null
+        val token = if (more && target == feedState && space == feedSpace) nextPage ?: return@locked else null
         if (token != null && token in seenPages) throw AppException(AppError.InvalidResponse)
-        val page = api.listPage(account, target, token)
+        val page = scopedPage(account, target, token, space)
         if (page.nextPageToken != null && (page.nextPageToken == token || page.nextPageToken in seenPages)) {
             throw AppException(AppError.InvalidResponse)
         }
         if (token == null) resetPages() else seenPages += token
         feedState = target
+        feedSpace = space
         nextPage = page.nextPageToken
         hasMore.value = nextPage != null
         publishFeed((if (token == null) emptyList() else mutableFeed.value) + page.memos)
@@ -130,7 +145,8 @@ class MemoRepository(
     }
 
     private fun acceptMemo(account: Account, memo: Memo) {
-        publishFeed(mutableFeed.value.filterNot { it.name == memo.name } + if (memo.state == feedState) listOf(memo) else emptyList())
+        val belongsToCurrentFeed = memo.state == feedState && (feedSpace == null || memo.space == feedSpace)
+        publishFeed(mutableFeed.value.filterNot { it.name == memo.name } + if (belongsToCurrentFeed) listOf(memo) else emptyList())
         if (account.supportsMemoReminderTime) {
             reminders.memoChanged(memo)
             syncScheduler.enqueueRepair()
@@ -139,8 +155,25 @@ class MemoRepository(
 
     private fun publishFeed(memos: List<Memo>) {
         val sorted = memos.distinctBy { it.name }.sortedWith(compareByDescending<Memo> { it.pinned }.thenByDescending { it.createTime })
-        if (feedState == "NORMAL") database.replaceFeed(sorted)
+        if (feedState == "NORMAL" && feedSpace == null) database.replaceFeed(sorted)
         mutableFeed.value = sorted
+    }
+
+    private fun scopedPage(account: Account, state: String, pageToken: String?, space: String?): MemoPage {
+        val first = api.listPage(account, state, pageToken, space)
+        if (space == null) return first
+        val matching = first.memos.filterTo(mutableListOf()) { it.space == space }
+        if (first.memos.all { it.space == space }) return first.copy(memos = matching)
+
+        var next = first.nextPageToken
+        val fallbackTokens = mutableSetOf<String>()
+        while (matching.size < 30 && next != null) {
+            if (!fallbackTokens.add(next)) throw AppException(AppError.InvalidResponse)
+            val page = api.listPage(account, state, next, space)
+            matching += page.memos.filter { it.space == space }
+            next = page.nextPageToken
+        }
+        return MemoPage(matching.distinctBy { it.name }, next)
     }
 
     private fun requireAccount(expected: AccountSummary): Account {
@@ -158,8 +191,10 @@ class MemoRepository(
         credentials.clear()
         database.clearAll()
         mutableFeed.value = emptyList()
+        mutableSpaces.value = null
         mutableAccount.value = null
         feedState = "NORMAL"
+        feedSpace = null
         resetPages()
     }
 }

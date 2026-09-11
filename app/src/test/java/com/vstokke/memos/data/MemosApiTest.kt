@@ -88,6 +88,44 @@ class MemosApiTest {
     }
 
     @Test
+    fun `spaces are listed across pages and sorted by title`() {
+        server.enqueue(MockResponse().setBody("""{"spaces":[{"name":"spaces/z","title":"Zeta","description":"Z"}],"nextPageToken":"next"}"""))
+        server.enqueue(MockResponse().setBody("""{"spaces":[{"name":"spaces/a","title":"Alpha"}]}"""))
+
+        val spaces = api.listSpaces(account())
+
+        assertEquals(listOf("Alpha", "Zeta"), spaces.map { it.title })
+        assertEquals("1000", server.takeRequest().requestUrl!!.queryParameter("pageSize"))
+        assertEquals("next", server.takeRequest().requestUrl!!.queryParameter("pageToken"))
+    }
+
+    @Test
+    fun `space feed uses scope and does not restrict results to current creator`() {
+        server.enqueue(MockResponse().setBody("""{"memos":[]}"""))
+
+        api.listPage(account(), space = "spaces/team")
+
+        val request = server.takeRequest().requestUrl!!
+        assertEquals("spaces/team", request.queryParameter("space"))
+        assertEquals(null, request.queryParameter("filter"))
+    }
+
+    @Test
+    fun `space memo creation sends placement and space visibility`() {
+        server.enqueue(
+            MockResponse().setBody(
+                """{"name":"memos/new","content":"Together","state":"NORMAL","visibility":"SPACE","space":"spaces/team","createTime":"2026-04-01T10:00:00Z"}""",
+            ),
+        )
+
+        api.createMemo(account(), NewMemo("Together", null, "SPACE", "spaces/team"))
+
+        val body = server.takeRequest().body.readUtf8()
+        assertTrue(body.contains("\"visibility\":\"SPACE\""))
+        assertTrue(body.contains("\"space\":\"spaces/team\""))
+    }
+
+    @Test
     fun `create sends private normal memo and checks reminder readback`() {
         val due = Instant.parse("2026-04-05T12:00:00Z")
         server.enqueue(

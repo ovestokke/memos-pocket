@@ -8,6 +8,7 @@ import android.provider.Settings
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
+import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.runtime.DisposableEffect
@@ -17,7 +18,9 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.SideEffect
 import androidx.core.content.ContextCompat
+import androidx.core.view.WindowCompat
 import androidx.core.net.toUri
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
@@ -46,6 +49,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        enableEdgeToEdge()
         requestedMemo.value = notificationTarget(intent)
         val container = (application as MemosPocketApp).container
         setContent {
@@ -112,7 +116,14 @@ class MainActivity : ComponentActivity() {
             val notificationsEnabled = container.notifications.canPublish()
             val exactAlarmsEnabled = container.reminders.canScheduleExact()
 
-            MemosPocketTheme(darkTheme = if (theme == "System") isSystemInDarkTheme() else theme == "Dark") {
+            val darkTheme = if (theme == "System") isSystemInDarkTheme() else theme == "Dark"
+            SideEffect {
+                WindowCompat.getInsetsController(window, window.decorView).apply {
+                    isAppearanceLightStatusBars = !darkTheme
+                    isAppearanceLightNavigationBars = !darkTheme
+                }
+            }
+            MemosPocketTheme(darkTheme = darkTheme) {
                 MemosPocketScreen(
                     state = state,
                     model = viewModel,

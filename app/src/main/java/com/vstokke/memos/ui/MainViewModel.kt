@@ -12,44 +12,121 @@ import com.vstokke.memos.data.MemoRepository
 import com.vstokke.memos.domain.*
 
 // Draft lives in the ViewModel, not a feed item: refresh and rotation cannot overwrite it.
-data class EditorDraft(val base: Memo?, val content: String, val visibility: String, val reminder: String) {
+data class EditorDraft(
+    val base: Memo?,
+    val content: String,
+    val visibility: String,
+    val reminder: String,
+    val space: String? = base?.space,
+) {
     val changed: Boolean get() = content != (base?.content ?: "") || visibility != (base?.visibility ?: "PRIVATE") ||
-        reminder != (base?.reminderTime?.toString() ?: "")
+        reminder != (base?.reminderTime?.toString() ?: "") || space != base?.space
 }
 
 data class MainUiState(
     val account: AccountSummary? = null,
     val feed: List<Memo> = emptyList(),
     val busy: Boolean = false,
+    val showProgress: Boolean = false,
+    val saving: Boolean = false,
     val error: String? = null,
     val notice: String? = null,
     val conflict: Boolean = false,
     val archive: Boolean = false,
     val hasMore: Boolean = false,
+    val spaces: List<Space> = emptyList(),
+    val selectedSpace: String? = null,
     val detail: Memo? = null,
     val draft: EditorDraft? = null,
 )
 
+private data class FeedSelection(val archive: Boolean, val space: String?)
+
+private fun MainUiState.selection() = FeedSelection(archive, selectedSpace)
+
 class MainViewModel(private val repository: MemoRepository) : ViewModel() {
-    private val mutableState = MutableStateFlow(MainUiState(account = repository.account()?.summary()))
+    private val defaultSelection = FeedSelection(archive = false, space = null)
+    private val initialSelection = FeedSelection(archive = false, space = repository.selectedSpace())
+    private val pageFeeds = mutableMapOf(defaultSelection to repository.feed.value)
+    private val pageHasMore = mutableMapOf(defaultSelection to repository.hasMore.value)
+    private var repositorySelection = defaultSelection
+    private var feedEmissionTarget: FeedSelection? = null
+    private var pendingPage: FeedSelection? = null
+    private val mutableState = MutableStateFlow(
+        MainUiState(
+            account = repository.account()?.summary(),
+            feed = pageFeeds[initialSelection].orEmpty(),
+            selectedSpace = initialSelection.space,
+        ),
+    )
     val state: StateFlow<MainUiState> = mutableState
 
     init {
-        viewModelScope.launch { repository.feed.collect { feed -> mutableState.update { it.copy(feed = feed) } } }
+        viewModelScope.launch {
+            repository.feed.collect { feed ->
+                val target = feedEmissionTarget ?: repositorySelection
+                pageFeeds[target] = feed
+                if (mutableState.value.selection() == target) {
+                    mutableState.update { it.copy(feed = feed) }
+                }
+            }
+        }
         viewModelScope.launch { repository.accountSummary.collect { account -> mutableState.update { it.copy(account = account) } } }
-        viewModelScope.launch { repository.hasMore.collect { more -> mutableState.update { it.copy(hasMore = more) } } }
-        if (mutableState.value.account != null) refresh()
+        viewModelScope.launch {
+            repository.hasMore.collect { more ->
+                val target = feedEmissionTarget ?: repositorySelection
+                pageHasMore[target] = more
+                if (mutableState.value.selection() == target) {
+                    mutableState.update { it.copy(hasMore = more) }
+                }
+            }
+        }
+        viewModelScope.launch {
+            repository.spaces.collect { spaces ->
+                if (spaces == null) return@collect
+                mutableState.update { it.copy(spaces = spaces) }
+                val selected = mutableState.value.selectedSpace
+                if (selected != null && spaces.none { it.name == selected }) {
+                    repository.saveSelectedSpace(null)
+                    val target = FeedSelection(mutableState.value.archive, null)
+                    selectPage(target)
+                    if (mutableState.value.busy) pendingPage = target else requestPage(target)
+                }
+            }
+        }
+        if (mutableState.value.account != null) {
+            if (initialSelection.space != null) pendingPage = initialSelection
+            refresh(showProgress = false)
+        }
     }
 
-    private fun runOperation(block: suspend () -> Unit) {
+    private fun runOperation(
+        showProgress: Boolean = true,
+        saving: Boolean = false,
+        block: suspend () -> Unit,
+    ) {
         if (mutableState.value.busy) return
-        mutableState.update { it.copy(busy = true, error = null, notice = null, conflict = false) }
+        mutableState.update {
+            it.copy(
+                busy = true,
+                showProgress = showProgress,
+                saving = saving,
+                error = null,
+                notice = null,
+                conflict = false,
+            )
+        }
         viewModelScope.launch {
             try { block() }
             catch (error: AppException) { mutableState.update { it.copy(error = error.error.userMessage(), conflict = error.error == AppError.Conflict) } }
             catch (error: CancellationException) { throw error }
             catch (_: Exception) { mutableState.update { it.copy(error = "The operation could not finish. Your draft has been kept.") } }
-            finally { mutableState.update { it.copy(busy = false) } }
+            finally {
+                mutableState.update { it.copy(busy = false, showProgress = false, saving = false) }
+                val target = pendingPage
+                pendingPage = null
+                if (target != null && target != repositorySelection) requestPage(target)
+            }
         }
     }
 
@@ -58,12 +135,22 @@ class MainViewModel(private val repository: MemoRepository) : ViewModel() {
         if (base == null || tokenInput.isBlank()) {
             mutableState.update { it.copy(error = "Enter an HTTPS server address and personal access token.") }; return
         }
-        runOperation { repository.configure(base, tokenInput.trim()); repository.refresh() }
+        runOperation {
+            repository.configure(base, tokenInput.trim())
+            repositorySelection = defaultSelection
+            repository.refresh()
+        }
     }
 
     fun refresh() {
+        val selection = state.value.selection()
+        if (selection != repositorySelection) requestPage(selection)
+        else refresh(showProgress = true)
+    }
+
+    private fun refresh(showProgress: Boolean) {
         val expected = state.value.account ?: return
-        runOperation {
+        runOperation(showProgress) {
             repository.refresh()
             val detail = state.value.detail
             if (detail != null && state.value.draft == null) {
@@ -72,11 +159,62 @@ class MainViewModel(private val repository: MemoRepository) : ViewModel() {
             }
         }
     }
+
+    private fun selectPage(selection: FeedSelection) {
+        mutableState.update {
+            it.copy(
+                archive = selection.archive,
+                selectedSpace = selection.space,
+                feed = pageFeeds[selection].orEmpty(),
+                hasMore = pageHasMore[selection] ?: false,
+                detail = null,
+            )
+        }
+    }
+
+    fun selectSpace(space: String?) {
+        if (space != null && state.value.spaces.none { it.name == space }) return
+        val current = state.value
+        if (current.selectedSpace == space) return
+        repository.saveSelectedSpace(space)
+        val draft = current.draft
+        val movedDraft = if (draft?.base == null && draft != null) {
+            draft.copy(
+                space = space,
+                visibility = when {
+                    space != null -> "SPACE"
+                    draft.visibility == "SPACE" -> "PRIVATE"
+                    else -> draft.visibility
+                },
+            )
+        } else draft
+        val selection = FeedSelection(current.archive, space)
+        selectPage(selection)
+        mutableState.update { it.copy(draft = movedDraft) }
+        requestPage(selection)
+    }
+
     fun page(archive: Boolean, more: Boolean = false) {
+        val selection = FeedSelection(archive, state.value.selectedSpace)
+        if (!more && state.value.selection() == selection) return
+        selectPage(selection)
+        requestPage(selection, more)
+    }
+
+    private fun requestPage(selection: FeedSelection, more: Boolean = false) {
         val account = state.value.account ?: return
-        runOperation {
-            repository.page(account, archive, more)
-            mutableState.update { it.copy(archive = archive, detail = null) }
+        if (state.value.busy) {
+            if (!more) pendingPage = selection
+            return
+        }
+        runOperation(showProgress = false) {
+            feedEmissionTarget = selection
+            try {
+                repository.page(account, selection.archive, more, selection.space)
+                repositorySelection = selection
+            } finally {
+                feedEmissionTarget = null
+            }
         }
     }
     fun open(name: String) {
@@ -86,7 +224,14 @@ class MainViewModel(private val repository: MemoRepository) : ViewModel() {
     fun closeDetail() { mutableState.update { it.copy(detail = null) } }
     fun beginEdit(memo: Memo? = null) {
         if (state.value.busy || state.value.draft != null) return
-        mutableState.update { it.copy(draft = EditorDraft(memo, memo?.content ?: "", memo?.visibility ?: "PRIVATE", memo?.reminderTime?.toString() ?: ""), error = null) }
+        val space = memo?.space ?: state.value.selectedSpace
+        val visibility = memo?.visibility ?: if (space == null) "PRIVATE" else "SPACE"
+        mutableState.update {
+            it.copy(
+                draft = EditorDraft(memo, memo?.content ?: "", visibility, memo?.reminderTime?.toString() ?: "", space),
+                error = null,
+            )
+        }
     }
     fun updateDraft(draft: EditorDraft) { if (!state.value.busy) mutableState.update { it.copy(draft = draft) } }
     fun discardDraft() { if (!state.value.busy) mutableState.update { it.copy(draft = null) } }
@@ -98,11 +243,11 @@ class MainViewModel(private val repository: MemoRepository) : ViewModel() {
         if (draft.reminder.isNotBlank() && reminder == null) {
             mutableState.update { it.copy(error = "Use an ISO timestamp with timezone, for example 2026-05-01T12:00:00Z, or clear the field.") }; return
         }
-        runOperation {
+        runOperation(saving = true) {
             val memo: Memo
             var preserved = true
             if (draft.base == null) {
-                val result = repository.create(account, NewMemo(draft.content, reminder, draft.visibility))
+                val result = repository.create(account, NewMemo(draft.content, reminder, draft.visibility, draft.space))
                 memo = result.memo; preserved = result.reminderPreserved
             } else {
                 memo = repository.edit(account, draft.base, MemoEdit(draft.content, draft.visibility, reminder))
@@ -128,7 +273,19 @@ class MainViewModel(private val repository: MemoRepository) : ViewModel() {
         }
     }
     fun dismissError() { mutableState.update { it.copy(error = null, notice = null) } }
-    fun logout() { runOperation { repository.logout(); mutableState.value = MainUiState(busy = true) } }
+    fun logout() {
+        runOperation {
+            repository.logout()
+            pageFeeds.clear()
+            pageFeeds[defaultSelection] = emptyList()
+            pageHasMore.clear()
+            pageHasMore[defaultSelection] = false
+            repositorySelection = defaultSelection
+            feedEmissionTarget = null
+            pendingPage = null
+            mutableState.value = MainUiState(busy = true)
+        }
+    }
 
     class Factory(private val repository: MemoRepository) : ViewModelProvider.Factory {
         @Suppress("UNCHECKED_CAST")

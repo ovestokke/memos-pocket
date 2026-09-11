@@ -55,6 +55,14 @@ class CredentialStore(context: Context) {
         }
     }
 
+    fun selectedSpace(): String? = preferences.getString(KEY_SELECTED_SPACE, null)
+
+    fun saveSelectedSpace(name: String?) {
+        preferences.edit {
+            if (name == null) remove(KEY_SELECTED_SPACE) else putString(KEY_SELECTED_SPACE, name)
+        }
+    }
+
     fun clear() {
         preferences.edit { clear() }
     }
@@ -84,6 +92,7 @@ class CredentialStore(context: Context) {
         const val KEY_USER = "user_name"
         const val KEY_DISPLAY = "display_name"
         const val KEY_MEMO_REMINDERS = "memo_reminder_time_supported"
+        const val KEY_SELECTED_SPACE = "selected_space"
         const val KEY_TOKEN = "token_ciphertext"
         const val TRANSFORMATION = "AES/GCM/NoPadding"
         const val IV_SIZE = 12

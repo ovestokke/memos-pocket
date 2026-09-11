@@ -20,6 +20,7 @@ class MainViewModelTest {
     private val account = Account("https://example.com", "secret", "users/alice", "Alice", true)
     private val feed = MutableStateFlow<List<Memo>>(emptyList())
     private val summary = MutableStateFlow<AccountSummary?>(account.summary())
+    private val spaces = MutableStateFlow<List<Space>?>(emptyList())
     private val memo = Memo("memos/one", "Server", "Server", "PRIVATE", Instant.EPOCH, null, null, creator = "users/alice")
     @Before fun setup() {
         Dispatchers.setMain(dispatcher)
@@ -27,6 +28,7 @@ class MainViewModelTest {
         `when`(repository.feed).thenReturn(feed)
         `when`(repository.accountSummary).thenReturn(summary)
         `when`(repository.hasMore).thenReturn(MutableStateFlow(false))
+        `when`(repository.spaces).thenReturn(spaces)
     }
     @After fun teardown() { Dispatchers.resetMain() }
 
@@ -66,6 +68,57 @@ class MainViewModelTest {
         assertEquals(draft, model.state.value.draft)
         assertFalse(model.state.value.account!!.supportsMemoReminderTime)
     }
+    @Test fun `page selection restores cached feeds immediately without navigation progress`() = runTest(dispatcher) {
+        `when`(repository.refresh()).thenReturn(account)
+        val normal = memo.copy(name = "memos/normal", content = "Normal")
+        val archived = memo.copy(name = "memos/archived", content = "Archived", state = "ARCHIVED")
+        lateinit var model: MainViewModel
+        var showedNavigationProgress = true
+        doAnswer {
+            showedNavigationProgress = model.state.value.showProgress
+            feed.value = listOf(archived)
+            null
+        }.`when`(repository).page(account.summary(), true, false)
+
+        model = MainViewModel(repository)
+        feed.value = listOf(normal)
+        advanceUntilIdle()
+
+        model.page(true)
+        advanceUntilIdle()
+        assertEquals(listOf(archived), model.state.value.feed)
+        assertFalse(showedNavigationProgress)
+
+        model.page(false)
+        assertFalse(model.state.value.archive)
+        assertEquals(listOf(normal), model.state.value.feed)
+    }
+
+    @Test fun `space selection is remembered and new drafts are created in that space`() = runTest(dispatcher) {
+        `when`(repository.refresh()).thenReturn(account)
+        val team = Space("spaces/team", "Team", "Shared notes")
+        val created = memo.copy(visibility = "SPACE", space = team.name)
+        `when`(repository.create(account.summary(), NewMemo("Together", null, "SPACE", team.name)))
+            .thenReturn(CreatedMemoResult(created, true))
+        val model = MainViewModel(repository)
+        spaces.value = listOf(team)
+        advanceUntilIdle()
+
+        model.updateDraft(EditorDraft(null, "Together", "PRIVATE", ""))
+        model.selectSpace(team.name)
+        advanceUntilIdle()
+
+        assertEquals(team.name, model.state.value.selectedSpace)
+        assertEquals(team.name, model.state.value.draft!!.space)
+        assertEquals("SPACE", model.state.value.draft!!.visibility)
+        verify(repository).saveSelectedSpace(team.name)
+        verify(repository).page(account.summary(), false, false, team.name)
+
+        model.save()
+        advanceUntilIdle()
+        verify(repository).create(account.summary(), NewMemo("Together", null, "SPACE", team.name))
+    }
+
     @Test fun `invalid reminder is not silently cleared or saved`() = runTest(dispatcher) {
         `when`(repository.refresh()).thenReturn(account)
         val model = MainViewModel(repository)

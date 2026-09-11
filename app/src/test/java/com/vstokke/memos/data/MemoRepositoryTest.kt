@@ -23,6 +23,7 @@ class MemoRepositoryTest {
     private val memo = Memo("memos/one", "Old", "Old", "PRIVATE", Instant.EPOCH, null,
         Instant.parse("2027-01-01T12:00:00Z"), creator = "users/alice")
     private fun <T> anyValue(): T = any<T>()
+    private fun <T> eqValue(value: T): T = eq(value)
 
     @Before fun setup() {
         `when`(credentials.load()).thenAnswer { stored }
@@ -34,12 +35,12 @@ class MemoRepositoryTest {
 
     @Test fun `capability removal cleans before failing feed and reaches observable account`() = runBlocking<Unit> {
         `when`(api.supportsMemoReminderTime("https://example.com", "secret")).thenReturn(false)
-        `when`(api.listPage(anyValue(), anyValue(), anyValue())).thenAnswer { throw AppException(AppError.Network) }
+        `when`(api.listPage(anyValue(), anyValue(), anyValue(), isNull())).thenAnswer { throw AppException(AppError.Network) }
         assertTrue(runCatching { repository.refresh() }.exceptionOrNull() is AppException)
         assertFalse(repository.accountSummary.value!!.supportsMemoReminderTime)
         val order = inOrder(reminders, api)
         order.verify(reminders).clearReminders()
-        order.verify(api).listPage(anyValue(), anyValue(), anyValue())
+        order.verify(api).listPage(anyValue(), anyValue(), anyValue(), isNull())
         verify(scheduler, never()).cancel()
     }
 
@@ -83,6 +84,40 @@ class MemoRepositoryTest {
         verify(reminders, never()).memoDeleted(anyValue())
     }
 
+    @Test fun `space page filters mixed server results and continues pagination`() = runBlocking<Unit> {
+        val account = stored!!
+        val team = memo.copy(name = "memos/team", space = "spaces/team")
+        val other = memo.copy(name = "memos/other", space = null)
+        val second = memo.copy(name = "memos/team-two", space = "spaces/team")
+        `when`(api.listPage(account, "NORMAL", null, "spaces/team"))
+            .thenReturn(MemoPage(listOf(team, other), "next"))
+        `when`(api.listPage(account, "NORMAL", "next", "spaces/team"))
+            .thenReturn(MemoPage(listOf(second), null))
+
+        repository.page(account.summary(), false, space = "spaces/team")
+
+        assertEquals(listOf(team.name, second.name).toSet(), repository.feed.value.map { it.name }.toSet())
+        verify(database, never()).replaceFeed(anyValue())
+    }
+
+    @Test fun `refresh preserves client side space scope`() = runBlocking<Unit> {
+        val account = stored!!
+        val team = memo.copy(name = "memos/team", space = "spaces/team")
+        val other = memo.copy(name = "memos/other", space = null)
+        var pageCall = 0
+        `when`(api.listPage(anyValue(), eqValue("NORMAL"), isNull(), eqValue("spaces/team"))).thenAnswer {
+            if (pageCall++ == 0) MemoPage(listOf(team), null) else MemoPage(listOf(team, other), null)
+        }
+        `when`(api.supportsMemoReminderTime(account.baseUrl, account.token)).thenReturn(true)
+        `when`(api.listSpaces(anyValue())).thenReturn(listOf(Space("spaces/team", "Team", "")))
+        `when`(api.listAllReminders(anyValue())).thenReturn(emptyList())
+
+        repository.page(account.summary(), false, space = "spaces/team")
+        repository.refresh()
+
+        assertEquals(listOf(team), repository.feed.value)
+    }
+
     @Test fun `reminder clear updates cache and coordinator from returned memo`() = runBlocking<Unit> {
         val account = stored!!
         val edit = MemoEdit("New", "PRIVATE", null)
@@ -100,7 +135,7 @@ class MemoRepositoryTest {
         `when`(api.supportsMemoReminderTime(account.baseUrl, account.token)).thenAnswer {
             entered.countDown(); check(release.await(5, TimeUnit.SECONDS)); true
         }
-        `when`(api.listPage(anyValue(), anyValue(), anyValue())).thenReturn(MemoPage(listOf(memo), null))
+        `when`(api.listPage(anyValue(), anyValue(), anyValue(), isNull())).thenReturn(MemoPage(listOf(memo), null))
         `when`(api.listAllReminders(anyValue())).thenReturn(emptyList())
         val refresh = async(Dispatchers.Default) { repository.refresh() }
         check(entered.await(5, TimeUnit.SECONDS))
