@@ -4,11 +4,11 @@ plugins {
     id("org.jetbrains.kotlin.plugin.compose")
 }
 
-val appVersionName = providers.environmentVariable("MEMOS_POCKET_VERSION_NAME").orElse("0.2.0")
+val appVersionName = providers.environmentVariable("MEMOS_POCKET_VERSION_NAME").orElse("0.3.0")
 val appVersionCode = providers.environmentVariable("MEMOS_POCKET_VERSION_CODE").map { value ->
     value.toIntOrNull()?.takeIf { it > 0 }
         ?: error("MEMOS_POCKET_VERSION_CODE must be a positive integer.")
-}.orElse(2000)
+}.orElse(3000)
 
 val releaseSigningValues = mapOf(
     "storeFile" to providers.environmentVariable("MEMOS_POCKET_STORE_FILE").orNull,
@@ -31,6 +31,7 @@ android {
         targetSdk = 36
         versionCode = appVersionCode.get()
         versionName = appVersionName.get()
+        manifestPlaceholders["appLabel"] = "Memos Pocket"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables.useSupportLibrary = true
@@ -48,6 +49,11 @@ android {
     }
 
     buildTypes {
+        debug {
+            applicationIdSuffix = ".debug"
+            versionNameSuffix = "-debug"
+            manifestPlaceholders["appLabel"] = "Memos Pocket Debug"
+        }
         release {
             isMinifyEnabled = true
             if (releaseSigningConfigured) {
@@ -69,7 +75,7 @@ android {
     }
     buildFeatures {
         compose = true
-        buildConfig = false
+        buildConfig = true
     }
     packaging {
         resources.excludes += "/META-INF/{AL2.0,LGPL2.1}"
@@ -81,6 +87,7 @@ dependencies {
     implementation(composeBom)
 
     implementation("androidx.activity:activity-compose:1.10.1")
+    implementation("androidx.browser:browser:1.10.0")
     implementation("androidx.core:core-ktx:1.16.0")
     implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.9.1")
     implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.9.1")

@@ -24,6 +24,7 @@ import androidx.compose.material.icons.outlined.ExpandMore
 import androidx.compose.material.icons.outlined.Info
 import androidx.compose.material.icons.outlined.Notifications
 import androidx.compose.material.icons.outlined.Palette
+import androidx.compose.material.icons.outlined.Refresh
 import androidx.compose.material.icons.outlined.Sync
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.HorizontalDivider
@@ -47,6 +48,7 @@ import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
+import com.vstokke.memos.domain.AuthMethod
 
 @Composable
 fun SettingsScreen(
@@ -62,6 +64,9 @@ fun SettingsScreen(
     onBattery: () -> Unit,
     onRefresh: () -> Unit,
     onLogout: () -> Unit,
+    onResolve: (String, Boolean) -> Unit = { _, _ -> },
+    onRetry: (String) -> Unit = {},
+    onSignIn: () -> Unit = {},
 ) {
     var confirmLogout by remember { mutableStateOf(false) }
     var testResult by remember { mutableStateOf<String?>(null) }
@@ -70,10 +75,70 @@ fun SettingsScreen(
     val version = remember {
         context.packageManager.getPackageInfo(context.packageName, 0).versionName ?: "unknown"
     }
+    val pendingLabel = "${state.sync.pending} local " +
+        if (state.sync.pending == 1) "change" else "changes"
+    val syncStatus = when {
+        state.sync.signInRequired -> "Sign in"
+        state.sync.syncing -> "Syncing"
+        state.sync.failed -> "Failed"
+        state.sync.pending > 0 -> "Waiting"
+        else -> "Ready"
+    }
+    val syncDescription = when {
+        state.sync.signInRequired -> "Sync is paused. Local memos and changes stay on this device."
+        state.sync.syncing -> "$pendingLabel waiting. Checking the server now."
+        state.sync.failed -> "The last sync did not finish. Local work is safe."
+        state.sync.pending > 0 -> "$pendingLabel saved on this device."
+        state.sync.lastSyncedAt != null -> "Last synced ${formatLocalMemoTime(state.sync.lastSyncedAt)}"
+        else -> "Local cache is ready."
+    }
 
     Column(
         Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal = 16.dp, vertical = 8.dp),
     ) {
+        SettingsSectionTitle("Offline and sync")
+        SettingsGroup {
+            SettingsRow(
+                icon = Icons.Outlined.Sync,
+                title = "Sync status",
+                supporting = syncDescription,
+                status = syncStatus,
+            )
+            if (state.sync.signInRequired) {
+                SettingsDivider()
+                SettingsRow(
+                    icon = Icons.Outlined.AccountCircle,
+                    title = "Sign in again",
+                    supporting = "Reconnect without removing local memos or changes",
+                    onClick = onSignIn,
+                )
+            }
+            SettingsDivider()
+            SettingsRow(
+                icon = Icons.Outlined.Refresh,
+                title = "Sync now",
+                supporting = if (state.sync.signInRequired) {
+                    "Sign in again before syncing"
+                } else {
+                    "Send local changes and check the server"
+                },
+                enabled = !state.busy && !state.sync.signInRequired,
+                onClick = onRefresh,
+            )
+            SettingsDivider()
+            SettingsRow(
+                icon = Icons.Outlined.Cloud,
+                title = "Offline storage",
+                supporting = if (state.sync.incomplete) {
+                    "The 100 MiB text limit is full; some older synced memos may be unavailable offline"
+                } else {
+                    "Readable memos are cached on this device, up to 100 MiB"
+                },
+                status = if (state.sync.incomplete) "Limit reached" else "Ready",
+            )
+        }
+        SyncIssues(state.syncIssues, onResolve, onRetry)
+
         SettingsSectionTitle("Notifications")
         SettingsGroup {
             SettingsRow(
@@ -98,10 +163,7 @@ fun SettingsScreen(
                 supporting = "Review battery restrictions",
                 onClick = onBattery,
             )
-        }
-
-        SettingsSectionTitle("Check and sync")
-        SettingsGroup {
+            SettingsDivider()
             SettingsRow(
                 icon = Icons.AutoMirrored.Outlined.Send,
                 title = "Send test notification",
@@ -113,14 +175,6 @@ fun SettingsScreen(
                         "Test blocked. Enable app notifications and the reminder channel, then try again."
                     }
                 },
-            )
-            SettingsDivider()
-            SettingsRow(
-                icon = Icons.Outlined.Sync,
-                title = "Sync now",
-                supporting = "Refresh memos and check server reminder support",
-                enabled = !state.busy,
-                onClick = onRefresh,
             )
         }
         testResult?.let {
@@ -210,7 +264,13 @@ fun SettingsScreen(
             SettingsRow(
                 icon = Icons.Outlined.AccountCircle,
                 title = state.account?.displayName ?: state.account?.userName ?: "Account",
-                supporting = listOfNotNull(state.account?.userName, state.account?.baseUrl).joinToString("\n"),
+                supporting = listOfNotNull(
+                    state.account?.userName,
+                    state.account?.baseUrl,
+                    state.account?.let {
+                        if (it.authMethod == AuthMethod.SESSION) "Account session" else "Legacy personal access token"
+                    },
+                ).joinToString("\n"),
             )
             SettingsDivider()
             SettingsRow(
@@ -229,7 +289,7 @@ fun SettingsScreen(
     if (confirmLogout) AlertDialog(
         onDismissRequest = { confirmLogout = false },
         title = { Text("Disconnect this account?") },
-        text = { Text("Removes this app’s credentials, cached memos, reminders and active notifications. Server memos are not deleted.") },
+        text = { Text("Removes this app’s credentials, cached memos, unsynced changes, conflicts, reminders and active notifications. Unsynced work will be lost. Server memos are not deleted.") },
         confirmButton = {
             TextButton(
                 onClick = {
@@ -246,7 +306,7 @@ fun SettingsScreen(
 }
 
 @Composable
-private fun SettingsSectionTitle(title: String) {
+internal fun SettingsSectionTitle(title: String) {
     Text(
         title,
         style = MaterialTheme.typography.titleSmall,
@@ -256,7 +316,7 @@ private fun SettingsSectionTitle(title: String) {
 }
 
 @Composable
-private fun SettingsGroup(content: @Composable () -> Unit) {
+internal fun SettingsGroup(content: @Composable () -> Unit) {
     Surface(
         color = MaterialTheme.colorScheme.surface,
         shape = MaterialTheme.shapes.medium,
@@ -267,7 +327,7 @@ private fun SettingsGroup(content: @Composable () -> Unit) {
 }
 
 @Composable
-private fun SettingsDivider() {
+internal fun SettingsDivider() {
     HorizontalDivider(
         modifier = Modifier.padding(start = 56.dp),
         color = MaterialTheme.colorScheme.outlineVariant,
@@ -275,7 +335,7 @@ private fun SettingsDivider() {
 }
 
 @Composable
-private fun SettingsRow(
+internal fun SettingsRow(
     icon: ImageVector?,
     title: String,
     supporting: String? = null,

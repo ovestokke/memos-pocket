@@ -63,6 +63,25 @@ class MemoCrudApiTest {
         val failure = runCatching { api.createMemo(account(false), NewMemo("Text", Instant.now())) }.exceptionOrNull()
         assertEquals(AppError.UnsupportedReminder, (failure as AppException).error)
     }
+    @Test fun `offline create sends stable memoId and returns ignored ID for conflict recovery`() {
+        val id = "mp-" + "a".repeat(32)
+        enqueue(memoJson.replace("memos/one", "memos/$id"))
+        api.createMemo(account(), NewMemo("New", null), id)
+        val request = server.takeRequest()
+        assertEquals(id, request.requestUrl!!.queryParameter("memoId"))
+        val body = JSONObject(request.body.readUtf8())
+        assertEquals("NORMAL", body.getString("state"))
+        assertFalse(body.has("pinned"))
+        enqueue()
+        assertEquals("memos/one", api.createMemo(account(), NewMemo("New", null), id).memo.name)
+    }
+    @Test fun `offline desired state uses one narrow patch without placement or attachments`() {
+        val base = base(); enqueue()
+        api.applyDesired(account(), base, base.copy(content = "New", pinned = false, state = "ARCHIVED", reminderTime = null))
+        val request = server.takeRequest()
+        assertEquals("content,update_time,pinned,state,reminder_time", request.requestUrl!!.queryParameter("updateMask"))
+        assertEquals(setOf("content", "pinned", "state"), JSONObject(request.body.readUtf8()).keys().asSequence().toSet())
+    }
     @Test fun `delete never forces associated data deletion`() {
         enqueue("{}")
         api.deleteMemo(account(), "memos/one")

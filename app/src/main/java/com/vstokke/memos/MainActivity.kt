@@ -21,6 +21,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.runtime.SideEffect
 import androidx.core.content.ContextCompat
 import androidx.core.view.WindowCompat
+import androidx.browser.customtabs.CustomTabsIntent
 import androidx.core.net.toUri
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
@@ -35,6 +36,12 @@ import kotlinx.coroutines.launch
 
 class MainActivity : ComponentActivity() {
     private val requestedMemo = mutableStateOf<com.vstokke.memos.domain.NotificationTarget?>(null)
+    private val oauthCallback = mutableStateOf<String?>(null)
+
+    private fun oauthCallback(intent: Intent): String? = intent.data?.takeIf {
+        it.scheme == packageName && it.authority == null && it.path == "/oauth2redirect"
+    }?.toString()
+
     private fun notificationTarget(intent: Intent): com.vstokke.memos.domain.NotificationTarget? {
         val baseUrl = intent.getStringExtra("memoBaseUrl") ?: return null
         val userName = intent.getStringExtra("memoUserName") ?: return null
@@ -45,18 +52,33 @@ class MainActivity : ComponentActivity() {
         super.onNewIntent(intent)
         setIntent(intent)
         requestedMemo.value = notificationTarget(intent)
+        oauthCallback.value = oauthCallback(intent)
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
         requestedMemo.value = notificationTarget(intent)
+        oauthCallback.value = oauthCallback(intent)
         val container = (application as MemosPocketApp).container
         setContent {
             val viewModel: MainViewModel = viewModel(factory = MainViewModel.Factory(container.repository))
             val state by viewModel.state.collectAsStateWithLifecycle()
             val preferences = remember { getSharedPreferences("appearance", MODE_PRIVATE) }
             var theme by remember { mutableStateOf(preferences.getString("theme", "System") ?: "System") }
+            LaunchedEffect(state.oauthLaunchUrl) {
+                val url = state.oauthLaunchUrl ?: return@LaunchedEffect
+                val launched = runCatching {
+                    CustomTabsIntent.Builder().setShowTitle(true).build().launchUrl(this@MainActivity, url.toUri())
+                }.isSuccess
+                viewModel.consumeOAuthLaunch(failed = !launched)
+            }
+            LaunchedEffect(oauthCallback.value) {
+                val callback = oauthCallback.value ?: return@LaunchedEffect
+                oauthCallback.value = null
+                intent.data = null
+                viewModel.completeSso(callback)
+            }
             LaunchedEffect(requestedMemo.value, state.busy, state.account, state.draft) {
                 val target = requestedMemo.value
                 if (target != null) {

@@ -24,9 +24,9 @@ class MemosPocketApp : Application() {
         container = AppContainer(this)
         container.notifications.ensureChannel()
         val account = container.repository.account()
+        if (account != null) container.syncScheduler.enqueueRepair()
         if (account?.supportsMemoReminderTime == true) {
             container.syncScheduler.ensurePeriodicSync()
-            container.syncScheduler.enqueueRepair()
             applicationScope.launch { container.reminders.processDueAndSchedule() }
         } else {
             if (account != null) container.syncScheduler.ensurePeriodicSync()

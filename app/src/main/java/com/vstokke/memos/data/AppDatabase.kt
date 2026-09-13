@@ -4,13 +4,15 @@ import android.content.ContentValues
 import android.content.Context
 import android.database.sqlite.SQLiteDatabase
 import android.database.sqlite.SQLiteOpenHelper
+import com.vstokke.memos.domain.Space
 import com.vstokke.memos.domain.Memo
+import com.vstokke.memos.domain.MemoSyncStatus
 import com.vstokke.memos.domain.ReminderRecord
 import com.vstokke.memos.domain.ReminderTime
 import java.time.Instant
 import java.util.UUID
 
-class AppDatabase(context: Context) : SQLiteOpenHelper(context, DATABASE_NAME, null, 2) {
+class AppDatabase(context: Context, databaseName: String = DATABASE_NAME) : SQLiteOpenHelper(context, databaseName, null, 3) {
     override fun onCreate(database: SQLiteDatabase) {
         database.execSQL(
             """
@@ -52,6 +54,7 @@ class AppDatabase(context: Context) : SQLiteOpenHelper(context, DATABASE_NAME, n
             """.trimIndent(),
         )
         database.execSQL("CREATE INDEX reminder_due_index ON reminders(due_epoch_ms)")
+        createOfflineTables(database)
     }
 
     override fun onUpgrade(database: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
@@ -62,6 +65,14 @@ class AppDatabase(context: Context) : SQLiteOpenHelper(context, DATABASE_NAME, n
             database.execSQL("ALTER TABLE feed_memos ADD COLUMN parent TEXT")
             database.execSQL("ALTER TABLE feed_memos ADD COLUMN space TEXT")
         }
+        if (oldVersion < 3) createOfflineTables(database)
+    }
+
+    private fun createOfflineTables(database: SQLiteDatabase) {
+        database.execSQL("ALTER TABLE feed_memos ADD COLUMN snapshot TEXT")
+        database.execSQL("CREATE TABLE memo_outbox (name TEXT PRIMARY KEY NOT NULL, base TEXT, desired TEXT NOT NULL, deleted INTEGER NOT NULL, revision INTEGER NOT NULL, sent TEXT, sent_deleted INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL, server TEXT)")
+        database.execSQL("CREATE TABLE offline_spaces (name TEXT PRIMARY KEY NOT NULL, title TEXT NOT NULL, description TEXT NOT NULL)")
+        database.execSQL("CREATE TABLE sync_metadata (key TEXT PRIMARY KEY NOT NULL, value TEXT NOT NULL)")
     }
 
     fun replaceFeed(memos: List<Memo>) {
@@ -79,13 +90,13 @@ class AppDatabase(context: Context) : SQLiteOpenHelper(context, DATABASE_NAME, n
     }
 
     fun feed(): List<Memo> = readableDatabase.rawQuery(
-        "SELECT name, content, snippet, visibility, create_epoch_ms, update_epoch_ms, reminder_epoch_ms, creator, state, pinned, parent, space FROM feed_memos ORDER BY pinned DESC, create_epoch_ms DESC",
+        "SELECT name, content, snippet, visibility, create_epoch_ms, update_epoch_ms, reminder_epoch_ms, creator, state, pinned, parent, space, snapshot FROM feed_memos ORDER BY pinned DESC, create_epoch_ms DESC",
         null,
     ).use { cursor ->
         buildList {
             while (cursor.moveToNext()) {
                 add(
-                    Memo(
+                    if (!cursor.isNull(12)) MemoJson.decode(cursor.getString(12)) else Memo(
                         name = cursor.getString(0),
                         content = cursor.getString(1),
                         snippet = cursor.getString(2),
@@ -100,6 +111,149 @@ class AppDatabase(context: Context) : SQLiteOpenHelper(context, DATABASE_NAME, n
             }
         }
     }
+
+    fun metadata(key: String): String? = readableDatabase.rawQuery(
+        "SELECT value FROM sync_metadata WHERE key = ?", arrayOf(key),
+    ).use { if (it.moveToFirst()) it.getString(0) else null }
+
+    fun setMetadata(key: String, value: String) {
+        writableDatabase.insertWithOnConflict("sync_metadata", null, ContentValues().apply {
+            put("key", key); put("value", value)
+        }, SQLiteDatabase.CONFLICT_REPLACE)
+    }
+
+    fun spaces(): List<Space> = readableDatabase.rawQuery(
+        "SELECT name, title, description FROM offline_spaces ORDER BY title", null,
+    ).use { cursor -> buildList {
+        while (cursor.moveToNext()) add(Space(cursor.getString(0), cursor.getString(1), cursor.getString(2)))
+    } }
+
+    fun pending(): List<PendingMemo> = readableDatabase.rawQuery(
+        "SELECT desired, base, deleted, revision, sent, sent_deleted, status, server FROM memo_outbox ORDER BY name", null,
+    ).use { cursor -> buildList {
+        while (cursor.moveToNext()) add(PendingMemo(
+            MemoJson.decode(cursor.getString(0)), if (cursor.isNull(1)) null else MemoJson.decode(cursor.getString(1)),
+            cursor.getInt(2) != 0, cursor.getLong(3), if (cursor.isNull(4)) null else MemoJson.decode(cursor.getString(4)),
+            cursor.getInt(5) != 0, cursor.getString(6), if (cursor.isNull(7)) null else MemoJson.decode(cursor.getString(7)),
+        ))
+    } }
+
+    fun localMemos(includeDeleted: Boolean = false): List<Memo> {
+        val operations = pending().associateBy { it.desired.name }
+        return feed().mapNotNull { memo ->
+            val operation = operations[memo.name]
+            if (!includeDeleted && operation?.deleted == true) null
+            else memo.copy(syncStatus = operation?.status ?: MemoSyncStatus.SYNCED)
+        }
+    }
+
+    private fun SQLiteDatabase.upsertMemo(memo: Memo) {
+        insertWithOnConflict("feed_memos", null, memo.toValues(), SQLiteDatabase.CONFLICT_REPLACE)
+    }
+
+    // The desired view and its durable upload intent always commit together.
+    fun queue(desired: Memo, base: Memo?, deleted: Boolean = false) {
+        writableDatabase.transaction {
+            val old = pending().firstOrNull { it.desired.name == desired.name }
+            if (deleted && old != null && old.base == null && old.sent == null) {
+                delete("memo_outbox", "name = ?", arrayOf(desired.name))
+                delete("feed_memos", "name = ?", arrayOf(desired.name))
+            } else {
+                upsertMemo(desired)
+                val values = ContentValues().apply {
+                    put("name", desired.name); put("desired", MemoJson.encode(desired))
+                    put("base", old?.base?.let(MemoJson::encode) ?: if (old == null) base?.let(MemoJson::encode) else null)
+                    put("deleted", if (deleted) 1 else 0); put("revision", (old?.revision ?: 0) + 1)
+                    put("sent", old?.sent?.let(MemoJson::encode)); put("sent_deleted", if (old?.sentDeleted == true) 1 else 0)
+                    put("status", old?.status?.takeIf { it == MemoSyncStatus.CONFLICT || it == MemoSyncStatus.FAILED } ?: MemoSyncStatus.PENDING)
+                    put("server", old?.server?.let(MemoJson::encode))
+                }
+                insertWithOnConflict("memo_outbox", null, values, SQLiteDatabase.CONFLICT_REPLACE)
+            }
+        }
+    }
+
+    fun markSent(operation: PendingMemo): Boolean =
+        writableDatabase.update("memo_outbox", ContentValues().apply {
+            put("sent", MemoJson.encode(operation.desired)); put("sent_deleted", if (operation.deleted) 1 else 0)
+        }, "name = ? AND revision = ?", arrayOf(operation.desired.name, operation.revision.toString())) != 0
+
+    fun markIssue(name: String, status: String, server: Memo?) {
+        writableDatabase.update("memo_outbox", ContentValues().apply {
+            put("status", status); put("server", server?.let(MemoJson::encode))
+        }, "name = ?", arrayOf(name))
+    }
+
+    fun acknowledge(operation: PendingMemo, server: Memo?) {
+        writableDatabase.transaction {
+            val current = pending().firstOrNull { it.desired.name == operation.desired.name } ?: return@transaction
+            if (current.revision == operation.revision) {
+                delete("memo_outbox", "name = ?", arrayOf(operation.desired.name))
+                if (server == null) delete("feed_memos", "name = ?", arrayOf(operation.desired.name)) else upsertMemo(server)
+            } else if (server != null) {
+                // A newer local edit stays visible; only advance its confirmed baseline.
+                update("memo_outbox", ContentValues().apply {
+                    put("base", MemoJson.encode(server)); putNull("sent"); put("sent_deleted", 0)
+                    put("status", MemoSyncStatus.PENDING)
+                }, "name = ?", arrayOf(operation.desired.name))
+            } else {
+                markIssue(operation.desired.name, MemoSyncStatus.CONFLICT, null)
+            }
+        }
+    }
+
+    fun resolve(name: String, copy: Memo?) {
+        writableDatabase.transaction {
+            val operation = pending().first { it.desired.name == name }
+            require(operation.status == MemoSyncStatus.CONFLICT)
+            delete("memo_outbox", "name = ?", arrayOf(name))
+            delete("feed_memos", "name = ?", arrayOf(name))
+            operation.server?.let { upsertMemo(it) }
+            if (copy != null) queue(copy, null)
+        }
+    }
+
+    fun retry(name: String): Boolean {
+        val operation = pending().firstOrNull { it.desired.name == name } ?: return false
+        if (operation.status != MemoSyncStatus.FAILED) return false
+        val values = ContentValues().apply {
+            put("status", MemoSyncStatus.PENDING)
+            // An unresolved create is never resent automatically. This explicit retry starts a new attempt.
+            if (operation.base == null) {
+                putNull("sent")
+                put("sent_deleted", 0)
+            }
+        }
+        return writableDatabase.update("memo_outbox", values, "name = ? AND status = ?",
+            arrayOf(name, MemoSyncStatus.FAILED)) != 0
+    }
+
+    // Called only after all scopes/pages succeeded. Pending rows are never replaced or pruned.
+    fun applyScan(memos: List<Memo>, spaces: List<Space>, byteLimit: Long = 100L * 1024 * 1024,
+        incomplete: Boolean = false, pruneCandidates: Set<String>? = null) {
+        writableDatabase.transaction {
+            val protected = pending().map { it.desired.name }.toSet()
+            val confirmedDuringScan = if (pruneCandidates == null) emptyList() else
+                feed().filter { it.name !in pruneCandidates }
+            val clean = (confirmedDuringScan + memos).distinctBy { it.name }.filterNot { it.name in protected }
+            val retained = CacheBudget.retain(clean, byteLimit, localMemos(true).filter { it.name in protected })
+            feed().filterNot { it.name in protected }.forEach { delete("feed_memos", "name = ?", arrayOf(it.name)) }
+            retained.forEach { upsertMemo(it) }
+            delete("offline_spaces", null, null)
+            spaces.forEach { space -> insertOrThrow("offline_spaces", null, ContentValues().apply {
+                put("name", space.name); put("title", space.title); put("description", space.description)
+            }) }
+            setMetadata("incomplete", (incomplete || retained.size < clean.size).toString())
+            setMetadata("spaces_known", "true")
+            setMetadata("last_sync", Instant.now().toString())
+        }
+    }
+
+    fun reminderRecords(): List<ReminderRecord> = readableDatabase.rawQuery(
+        "SELECT memo_name, due_key, content FROM reminders", null,
+    ).use { cursor -> buildList {
+        while (cursor.moveToNext()) add(ReminderRecord(cursor.getString(0), Instant.parse(cursor.getString(1)), cursor.getString(2)))
+    } }
 
     fun reconcileReminders(records: List<ReminderRecord>) {
         val generation = UUID.randomUUID().toString()
@@ -206,10 +360,14 @@ class AppDatabase(context: Context) : SQLiteOpenHelper(context, DATABASE_NAME, n
             delete("feed_memos", null, null)
             delete("reminders", null, null)
             delete("reminder_deliveries", null, null)
+            delete("memo_outbox", null, null)
+            delete("offline_spaces", null, null)
+            delete("sync_metadata", null, null)
         }
     }
 
     private fun Memo.toValues() = ContentValues().apply {
+        put("snapshot", MemoJson.encode(this@toValues))
         put("name", name)
         put("content", content)
         put("snippet", snippet)

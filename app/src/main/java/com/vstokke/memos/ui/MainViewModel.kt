@@ -8,6 +8,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import com.vstokke.memos.data.PendingMemo
 import com.vstokke.memos.data.MemoRepository
 import com.vstokke.memos.domain.*
 
@@ -38,6 +39,12 @@ data class MainUiState(
     val selectedSpace: String? = null,
     val detail: Memo? = null,
     val draft: EditorDraft? = null,
+    val signInBaseUrl: String? = null,
+    val signInOptions: SignInOptions? = null,
+    val oauthLaunchUrl: String? = null,
+    val sync: SyncState = SyncState(),
+    val syncIssues: List<PendingMemo> = emptyList(),
+    val reauthenticating: Boolean = false,
 )
 
 private data class FeedSelection(val archive: Boolean, val space: String?)
@@ -62,6 +69,8 @@ class MainViewModel(private val repository: MemoRepository) : ViewModel() {
     val state: StateFlow<MainUiState> = mutableState
 
     init {
+        viewModelScope.launch { repository.syncState.collect { sync -> mutableState.update { it.copy(sync = sync) } } }
+        viewModelScope.launch { repository.syncIssues.collect { issues -> mutableState.update { it.copy(syncIssues = issues) } } }
         viewModelScope.launch {
             repository.feed.collect { feed ->
                 val target = feedEmissionTarget ?: repositorySelection
@@ -95,8 +104,8 @@ class MainViewModel(private val repository: MemoRepository) : ViewModel() {
             }
         }
         if (mutableState.value.account != null) {
-            if (initialSelection.space != null) pendingPage = initialSelection
-            refresh(showProgress = false)
+            requestPage(initialSelection)
+            repository.scheduleSync()
         }
     }
 
@@ -118,9 +127,15 @@ class MainViewModel(private val repository: MemoRepository) : ViewModel() {
         }
         viewModelScope.launch {
             try { block() }
-            catch (error: AppException) { mutableState.update { it.copy(error = error.error.userMessage(), conflict = error.error == AppError.Conflict) } }
+            catch (error: AppException) {
+                mutableState.update { it.copy(error = error.error.userMessage(), conflict = error.error == AppError.Conflict) }
+            }
             catch (error: CancellationException) { throw error }
-            catch (_: Exception) { mutableState.update { it.copy(error = "The operation could not finish. Your draft has been kept.") } }
+            catch (_: Exception) {
+                mutableState.update {
+                    it.copy(error = if (it.draft == null) "The operation could not finish." else "The operation could not finish. Your draft has been kept.")
+                }
+            }
             finally {
                 mutableState.update { it.copy(busy = false, showProgress = false, saving = false) }
                 val target = pendingPage
@@ -130,34 +145,77 @@ class MainViewModel(private val repository: MemoRepository) : ViewModel() {
         }
     }
 
-    fun connect(instanceInput: String, tokenInput: String) {
+    fun loadSignInOptions(instanceInput: String) {
         val base = InstanceUrl.normalize(instanceInput)
-        if (base == null || tokenInput.isBlank()) {
-            mutableState.update { it.copy(error = "Enter an HTTPS server address and personal access token.") }; return
+        if (base == null) {
+            mutableState.update { it.copy(error = "Enter a valid HTTPS Memos server address.") }
+            return
         }
         runOperation {
-            repository.configure(base, tokenInput.trim())
-            repositorySelection = defaultSelection
-            repository.refresh()
+            val options = repository.signInOptions(base)
+            mutableState.update { it.copy(signInBaseUrl = base, signInOptions = options) }
         }
     }
 
-    fun refresh() {
-        val selection = state.value.selection()
-        if (selection != repositorySelection) requestPage(selection)
-        else refresh(showProgress = true)
+    fun signInWithPassword(username: String, password: String) {
+        val base = state.value.signInBaseUrl ?: return
+        if (username.isBlank() || password.isBlank()) return
+        runOperation {
+            repository.signInWithPassword(base, username.trim(), password)
+            finishSignIn()
+        }
     }
 
-    private fun refresh(showProgress: Boolean) {
-        val expected = state.value.account ?: return
-        runOperation(showProgress) {
-            repository.refresh()
-            val detail = state.value.detail
-            if (detail != null && state.value.draft == null) {
-                val updated = repository.get(expected, detail.name)
-                mutableState.update { it.copy(detail = updated) }
-            }
+    fun startSso(providerName: String) {
+        val current = state.value
+        val base = current.signInBaseUrl ?: return
+        val provider = current.signInOptions?.providers?.firstOrNull { it.name == providerName } ?: return
+        runOperation {
+            val url = repository.beginSso(base, provider)
+            mutableState.update { it.copy(oauthLaunchUrl = url) }
         }
+    }
+
+    fun consumeOAuthLaunch(failed: Boolean = false) {
+        mutableState.update {
+            it.copy(
+                oauthLaunchUrl = null,
+                error = if (failed) "No browser is available to complete sign-in." else it.error,
+            )
+        }
+    }
+
+    fun completeSso(callbackUrl: String) {
+        runOperation {
+            repository.completeSso(callbackUrl)
+            finishSignIn()
+        }
+    }
+
+    private suspend fun finishSignIn() {
+        mutableState.update { it.copy(reauthenticating = false) }
+        val account = repository.account()?.summary() ?: return
+        repository.page(account, state.value.archive, space = state.value.selectedSpace)
+        repository.scheduleSync()
+    }
+
+    fun refresh() = repository.scheduleSync()
+
+    fun requestSignIn() {
+        mutableState.update { it.copy(reauthenticating = true, signInBaseUrl = null, signInOptions = null) }
+    }
+    fun cancelSignIn() { mutableState.update { it.copy(reauthenticating = false) } }
+    fun resolveConflict(name: String, preserveAsNew: Boolean) {
+        val account = state.value.account ?: return
+        runOperation {
+            repository.resolveConflict(account, name, preserveAsNew)
+            mutableState.update { it.copy(detail = null) }
+        }
+    }
+
+    fun retryFailed(name: String) {
+        val account = state.value.account ?: return
+        runOperation(showProgress = false) { repository.retryFailed(account, name) }
     }
 
     private fun selectPage(selection: FeedSelection) {
@@ -254,7 +312,11 @@ class MainViewModel(private val repository: MemoRepository) : ViewModel() {
                 preserved = memo.reminderTime == reminder
             }
             mutableState.update { it.copy(draft = null, detail = if (draft.base == null) null else memo,
-                notice = if (preserved) null else "Saved, but the server did not preserve the reminder. Check Settings; delivery is not confirmed.") }
+                notice = when {
+                    !preserved -> "Saved, but the server did not preserve the reminder. Check Settings; delivery is not confirmed."
+                    memo.syncStatus == MemoSyncStatus.FAILED -> "Saved locally. Sync is stopped for this memo; review Settings."
+                    else -> "Saved locally. Waiting to sync."
+                }) }
         }
     }
     fun action(memo: Memo, action: String) {

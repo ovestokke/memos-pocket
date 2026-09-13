@@ -29,10 +29,12 @@ class MainViewModelTest {
         `when`(repository.accountSummary).thenReturn(summary)
         `when`(repository.hasMore).thenReturn(MutableStateFlow(false))
         `when`(repository.spaces).thenReturn(spaces)
+        `when`(repository.syncState).thenReturn(MutableStateFlow(SyncState()))
+        `when`(repository.syncIssues).thenReturn(MutableStateFlow(emptyList()))
     }
     @After fun teardown() { Dispatchers.resetMain() }
 
-    @Test fun `inline creation clears draft and stays on feed without saved notice`() = runTest(dispatcher) {
+    @Test fun `inline creation clears draft and reports durable local save`() = runTest(dispatcher) {
         `when`(repository.refresh()).thenReturn(account)
         `when`(repository.create(account.summary(), NewMemo("New thought", null, "PRIVATE")))
             .thenReturn(CreatedMemoResult(memo, true))
@@ -41,7 +43,7 @@ class MainViewModelTest {
         model.save(); advanceUntilIdle()
         assertNull(model.state.value.draft)
         assertNull(model.state.value.detail)
-        assertNull(model.state.value.notice)
+        assertEquals("Saved locally. Waiting to sync.", model.state.value.notice)
     }
 
     @Test fun `failed save keeps exact draft and base for retry`() = runTest(dispatcher) {

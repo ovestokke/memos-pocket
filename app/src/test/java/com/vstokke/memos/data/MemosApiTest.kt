@@ -31,6 +31,85 @@ class MemosApiTest {
     }
 
     @Test
+    fun `sign in options follow server password policy and advertised providers`() {
+        server.enqueue(MockResponse().setBody("""{"generalSetting":{"disallowPasswordAuth":false}}"""))
+        server.enqueue(
+            MockResponse().setBody(
+                """{"identityProviders":[{"name":"identity-providers/authelia","type":"OAUTH2","title":"Authelia","config":{"oauth2Config":{"clientId":"memos","authUrl":"https://auth.example.com/authorize","scopes":["openid","profile"]}}}]}""",
+            ),
+        )
+
+        val options = api.signInOptions(server.url("/").toString().trimEnd('/'))
+
+        assertTrue(options.passwordAllowed)
+        assertEquals(listOf("Authelia"), options.providers.map { it.title })
+        assertEquals("/api/v1/instance/settings/GENERAL", server.takeRequest().path)
+        assertEquals("/api/v1/identity-providers", server.takeRequest().path)
+    }
+
+    @Test
+    fun `password sign in captures refresh cookie and does not persist password in result`() {
+        server.enqueue(
+            MockResponse()
+                .addHeader("Set-Cookie", "memos_refresh=refresh-one; Path=/; HttpOnly")
+                .setBody(
+                    """{"user":{"name":"users/alice","username":"alice","displayName":"Alice"},"accessToken":"access-one","accessTokenExpiresAt":"2026-10-01T12:15:00Z"}""",
+                ),
+        )
+
+        val session = api.signInWithPassword(server.url("/").toString().trimEnd('/'), "alice", "correct horse")
+
+        assertEquals("access-one", session.tokens.accessToken)
+        assertEquals("refresh-one", session.tokens.refreshToken)
+        val request = server.takeRequest()
+        assertEquals("/api/v1/auth/signin", request.path)
+        val body = request.body.readUtf8()
+        assertTrue(body.contains("\"passwordCredentials\""))
+        assertTrue(body.contains("\"username\":\"alice\""))
+        assertTrue(body.contains("\"password\":\"correct horse\""))
+    }
+
+    @Test
+    fun `session refresh sends current cookie and stores rotated cookie`() {
+        server.enqueue(
+            MockResponse()
+                .addHeader("Set-Cookie", "memos_refresh=refresh-two; Path=/; HttpOnly")
+                .setBody("""{"accessToken":"access-two","expiresAt":"2026-10-01T12:30:00Z"}"""),
+        )
+
+        val tokens = api.refreshSession(server.url("/").toString().trimEnd('/'), "refresh-one")
+
+        assertEquals("refresh-two", tokens.refreshToken)
+        val request = server.takeRequest()
+        assertEquals("memos_refresh=refresh-one", request.getHeader("Cookie"))
+        assertEquals("{}", request.body.readUtf8())
+    }
+
+    @Test
+    fun `sso sign in accepts grpc gateway cookie and sends provider code verifier and native redirect`() {
+        server.enqueue(
+            MockResponse()
+                .addHeader("Grpc-Metadata-Set-Cookie", "memos_refresh=refresh-sso; Path=/; HttpOnly")
+                .setBody(
+                    """{"user":{"name":"users/alice","username":"alice"},"accessToken":"access-sso","accessTokenExpiresAt":"2026-10-01T12:15:00Z"}""",
+                ),
+        )
+
+        api.signInWithSso(
+            server.url("/").toString().trimEnd('/'),
+            "identity-providers/authelia",
+            "auth-code",
+            "pkce-verifier",
+        )
+
+        val body = server.takeRequest().body.readUtf8()
+        assertTrue(body.contains("\"idpName\":\"identity-providers/authelia\""))
+        assertTrue(body.contains("\"code\":\"auth-code\""))
+        assertTrue(body.contains("\"redirectUri\":\"${OAuthFlow.REDIRECT_URI}\""))
+        assertTrue(body.contains("\"codeVerifier\":\"pkce-verifier\""))
+    }
+
+    @Test
     fun `current user reads wrapper and sends bearer token`() {
         server.enqueue(MockResponse().setBody("""{"user":{"name":"users/alice","username":"alice","displayName":"Alice"}}"""))
 

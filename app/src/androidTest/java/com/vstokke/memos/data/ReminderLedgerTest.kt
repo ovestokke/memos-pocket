@@ -12,22 +12,23 @@ import java.time.Instant
 class ReminderLedgerTest {
     @Test
     fun pendingBatchSurvivesReopenAndOnlyPublishedItemsAreAcknowledged() {
-        // Use instrumentation APK's isolated sandbox, never the signed-in target app's data.
-        val context = InstrumentationRegistry.getInstrumentation().context
+        // A dedicated test database, never the signed-in app database.
+        val context = InstrumentationRegistry.getInstrumentation().targetContext
+        check(context.packageName.endsWith(".debug"))
         val now = Instant.parse("2026-05-01T12:00:01Z")
         val first = ReminderRecord("memos/first", Instant.parse("2026-05-01T12:00:00.123456Z"), "Test")
         val second = first.copy(memoName = "memos/second")
-        var db = AppDatabase(context)
+        var db = AppDatabase(context, "reminder-ledger-test.db")
         try {
             db.clearAll()
             db.reconcileReminders(listOf(first, second))
             assertEquals(setOf(first, second), db.pendingDue(now, 86400).toSet())
             db.close()
-            db = AppDatabase(context)
+            db = AppDatabase(context, "reminder-ledger-test.db")
             assertEquals(setOf(first, second), db.pendingDue(now, 86400).toSet())
             db.acknowledgeDelivery(first, now)
             db.close()
-            db = AppDatabase(context)
+            db = AppDatabase(context, "reminder-ledger-test.db")
             assertEquals(listOf(second), db.pendingDue(now, 86400))
             // A publication failure has no acknowledgment; retry keeps exact nanoseconds.
             assertEquals(second.dueAt, db.pendingDue(now, 86400).single().dueAt)

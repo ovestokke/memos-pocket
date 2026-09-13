@@ -32,7 +32,7 @@ class SyncScheduler(private val context: Context) {
             .build()
         WorkManager.getInstance(context).enqueueUniqueWork(
             REPAIR_WORK,
-            ExistingWorkPolicy.KEEP,
+            ExistingWorkPolicy.APPEND_OR_REPLACE,
             request,
         )
     }

@@ -4,11 +4,11 @@ An unofficial Android client for [Memos](https://www.usememos.com/). The app is 
 
 ## Implemented
 
-- HTTPS server + personal access token login, with Keystore-encrypted credentials.
-- Paginated normal and archived feeds, pinned-first ordering, memo detail fetched independently of the feed.
+- HTTPS server discovery, username/password and provider-neutral OAuth sign-in, with PKCE and Keystore-encrypted rotating sessions.
+- Offline-first normal, archived and Space feeds with complete locally cached Markdown and pinned-first ordering.
 - Member-space discovery, space-scoped feeds, remembered space selection and space memo creation.
 - Create, edit, pin/unpin, archive/restore, copy link/content and confirmed delete without `force`.
-- Precise update masks, best-effort concurrent-edit detection, retained drafts on rotation/network errors, explicit server reload on conflict.
+- Durable local creates, edits, pin/archive actions and deletion requests; automatic network-constrained sync and manual conflict resolution.
 - Compact Compose screens adapted from actual web-Memos colors and layouts, drawer/sidebar navigation, persistent system/light/dark theme.
 - Settings with account information, confirmed disconnect, Android notification/channel and exact-alarm controls, sync/alarm diagnostics and an explicit test notification.
 - Capability-controlled server reminders, local delivery ledger, stale reminder cleanup and background reconciliation.
@@ -30,7 +30,7 @@ Artifacts:
 - Release APK: `app/build/outputs/apk/release/app-release.apk` when signing is configured; otherwise `app-release-unsigned.apk`
 - Release bundle: `app/build/outputs/bundle/release/app-release.aab`
 
-The namespace and application ID are **`com.vstokke.memos`**. App name remains Memos Pocket.
+The release namespace and application ID are **`com.vstokke.memos`**. Debug builds use **`com.vstokke.memos.debug`** and the label **Memos Pocket Debug**, so they can be installed beside the Obtainium release without sharing credentials or data.
 
 The old `com.vstokke.memopocket` installation cannot be updated by this package. It has a separate sandbox, credentials, Keystore, permissions and delivery history. No credentials are exported or copied.
 
@@ -40,9 +40,9 @@ Stable APKs are published through [GitHub Releases](https://github.com/ovestokke
 
 `https://github.com/ovestokke/memos-pocket`
 
-The first production-signed APK cannot update a debug-signed development install. Uninstall the debug app once, install the release through Obtainium, and sign in again. Later releases update in place.
+The first production-signed APK cannot update an older debug-signed build that used the release application ID. That one-time transition requires uninstalling the old debug build before installing through Obtainium. Current debug builds are a separate app; stable releases update the production app in place.
 
-See [`docs/releasing.md`](docs/releasing.md) for signing-key setup and the tag-based release procedure.
+See [`docs/releasing.md`](docs/releasing.md) for signing-key setup and the tag-based release procedure. Self-hosted login and OAuth callback setup are documented in [`docs/authentication.md`](docs/authentication.md).
 
 ## Release signing
 
@@ -57,7 +57,7 @@ Without these, release artifacts are unsigned and must not be distributed. Keyst
 
 ## Reminder behavior and diagnostics
 
-The server's `reminderTime` is the source of truth. Controls are enabled only when `/api/v1/instance/profile` advertises `memoReminderTimeSupported: true`. No hostname inference or hidden device-only fallback is used. Network failures retain the last confirmed capability; confirmed removal clears local reminders before any feed request can fail. Workers do not cancel themselves during cleanup.
+The server's `reminderTime` is the synchronized value; pending local reminder edits remain an overlay until acknowledged. Controls are enabled only when `/api/v1/instance/profile` advertises `memoReminderTimeSupported: true`. No hostname inference or hidden device-only fallback is used. Network failures retain the last confirmed capability; confirmed removal clears local reminders before any feed request can fail. Workers do not cancel themselves during cleanup.
 
 The parent session observed the public server still at commit `bbe3fc141132`, without that capability. The old tablet package had `POST_NOTIFICATIONS granted=false`, `SCHEDULE_EXACT_ALARM granted=true`, and no matching scheduled alarm. These observations identify separate blockers; they do not establish an end-to-end trace of the user's test memo.
 
@@ -69,16 +69,18 @@ WorkManager requests approximately 15-minute sync intervals, subject to Android/
 
 ## API and safety
 
-Implemented routes are `/api/v1/auth/me`, `/api/v1/instance/profile`, `/api/v1/spaces`, paginated `/api/v1/memos`, and GET/PATCH/DELETE `/api/v1/memos/{id}`. Space feeds use server scope when available and verify placement client-side for compatibility.
+Authentication uses `/api/v1/auth/signin`, `/api/v1/auth/refresh`, `/api/v1/auth/signout`, `/api/v1/auth/me`, instance settings and `/api/v1/identity-providers`. Content routes include `/api/v1/instance/profile`, `/api/v1/spaces`, paginated `/api/v1/memos`, and GET/PATCH/DELETE `/api/v1/memos/{id}`. Space feeds use server scope when available and verify placement client-side for compatibility.
 
 JSON fields use lower camel case. REST `updateMask` query values use proto paths such as `content,update_time,reminder_time`: grpc-gateway does not apply JSON FieldMask camel-case conversion to this query parameter. Clearing a reminder includes `reminder_time` in the mask and omits its timestamp. Content-only mutations never echo attachments, relations, placement or unknown JSON fields.
 
-Writes first fetch the current memo and compare known fields with the editor's base. This detects many conflicts but is not atomic; the API has no revision precondition. Author-only menus follow the server handler, not a broader web superuser UI exception. The server remains authoritative for space membership. A failed delete leaves the local memo visible. Creation has no automatic retry, including OkHttp connection retry, because an ambiguous response could otherwise duplicate a memo.
+Writes commit the local memo and upload intent in one SQLite transaction. Sync compares the last confirmed server snapshot before sending one precise mutation. This detects many conflicts but is not atomic; the API has no revision precondition. Conflicts preserve both versions in Settings. Pending deletions are hidden from feeds but remain available in Settings. Stable client-selected `memoId` values and frozen dispatched intents allow GET-based recovery after ambiguous responses; a server that ignores the requested ID stops that upload rather than risking duplicate automatic retries.
 
-Account changes, writes and sync share a mutex; UI requests also carry expected server/user identity. Disconnect removes credentials, cache, local reminders and active notifications, never server memos.
+Local writes have a short database lock separate from the network sync lock. UI requests carry the expected server/user identity. Authentication failure pauses sync without deleting data; signing in to the same account resumes pending work. Account replacement is blocked while local work remains. Explicitly confirmed disconnect removes credentials, cache, unsynced work, conflicts, local reminders and active notifications, never server memos.
 
-TLS verification, redirect blocking, HTTPS-only input, backup exclusion and private lock-screen notifications are retained. Tokens never enter URLs, diagnostics, shared UI state or error messages. Cached memo text is sandboxed but not separately encrypted. Copied links contain no token and do not change visibility.
+The text cache targets all readable My memos, Archived and advertised Spaces. A completed scan retains the newest clean entries within a 100 MiB UTF-8 content/snippet budget. Pending changes, tombstones and conflicts are never evicted; Settings reports incomplete caching. This is a text budget, not a limit on the SQLite file, JSON snapshots, reminders or unsynced work. Attachments are not downloaded. See [`docs/offline.md`](docs/offline.md) for recovery and validation details.
+
+TLS verification, redirect blocking, HTTPS-only input, backup exclusion and private lock-screen notifications are retained. Tokens, passwords and memo bodies never enter logs, diagnostics or error messages. Refresh credentials are encrypted with a non-exportable Android Keystore key; short-lived session access tokens remain in process memory. Cached memo text is sandboxed but not separately encrypted. Copied links contain no token and do not change visibility.
 
 ## Validation
 
-49 API/domain/repository/ViewModel tests currently pass. A real-SQLite instrumentation regression test for interrupted batches and submillisecond timestamps compiles but has not yet run on a device. Lint and debug/release APK/AAB builds pass; bounded logs are in `validation/`. Repository tests use mocks, and ViewModel tests do not exercise Compose layout. The plan records pending live CRUD, database/alarm instrumentation, actual notification delivery, installation transition and visual/device acceptance. Building is not proof of those behaviors.
+77 JVM tests and 14 real-SQLite/device tests pass with no failures or skips. The device suite covers v1/v2 database upgrades, transaction rollback, reopen persistence, tombstones, conflicts, cache limits and reminder delivery deduplication in the isolated debug package. Lint, debug/release APK builds and the release bundle pass under JDK 17. Repository tests otherwise use mocks, and ViewModel tests do not exercise Compose layout. Live offline CRUD/reconnect races, notification delivery and end-to-end browser SSO remain device acceptance work; passing builds are not proof of those behaviors.

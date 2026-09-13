@@ -50,6 +50,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import com.vstokke.memos.domain.AccountSummary
 import com.vstokke.memos.domain.Memo
+import com.vstokke.memos.domain.MemoSyncStatus
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
 import java.time.format.FormatStyle
@@ -251,6 +252,8 @@ private fun MemoHeader(
 
     Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.Top) {
         Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+            if (memo.syncStatus != MemoSyncStatus.SYNCED) Text(memo.syncStatus, style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.primary)
             Row(
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
                 verticalAlignment = Alignment.CenterVertically,

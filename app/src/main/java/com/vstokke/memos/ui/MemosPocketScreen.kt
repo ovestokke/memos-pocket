@@ -61,6 +61,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.unit.dp
+import com.vstokke.memos.domain.MemoSyncStatus
 import com.vstokke.memos.domain.Space
 
 private data class AppDestination(val label: String, val icon: ImageVector)
@@ -119,7 +120,7 @@ fun MemosPocketScreen(
     if (confirmDiscard) AlertDialog(
         onDismissRequest = { confirmDiscard = false },
         title = { Text("Discard unsaved changes?") },
-        text = { Text("Your changes have not been saved to the server.") },
+        text = { Text("Your changes have not been saved locally.") },
         confirmButton = {
             TextButton(onClick = {
                 model.discardDraft()
@@ -147,8 +148,16 @@ fun MemosPocketScreen(
     )
 
     Surface(Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
-        if (state.account == null) {
-            LoginScreen(state, model::connect)
+        if (state.account == null || state.reauthenticating) {
+            Column {
+            if (state.reauthenticating) TextButton(onClick = model::cancelSignIn) { Text("Back to offline memos") }
+            LoginScreen(
+                state = state,
+                onLoadOptions = model::loadSignInOptions,
+                onPasswordSignIn = model::signInWithPassword,
+                onSsoSignIn = model::startSso,
+            )
+            }
             return@Surface
         }
 
@@ -219,7 +228,17 @@ fun MemosPocketScreen(
                         Modifier.padding(padding).fillMaxSize().imePadding(),
                         horizontalAlignment = Alignment.CenterHorizontally,
                     ) {
-                        if (state.showProgress) LinearProgressIndicator(Modifier.fillMaxWidth())
+                        if (state.showProgress || state.sync.syncing) LinearProgressIndicator(Modifier.fillMaxWidth())
+                        val syncMessage = if (destination == "Settings") null else when {
+                            state.sync.signInRequired -> "Sign-in required. Local memos and changes are safe. Open Settings to sign in."
+                            state.syncIssues.any { it.status == MemoSyncStatus.CONFLICT } -> "Sync conflict. Both versions are kept. Resolve in Settings."
+                            state.syncIssues.any { it.status == MemoSyncStatus.FAILED } -> "Some changes could not sync. Review them in Settings."
+                            state.sync.failed -> "Server unavailable. You can keep writing offline."
+                            state.sync.pending > 0 -> "${state.sync.pending} changes saved locally · Waiting to sync"
+                            state.sync.incomplete -> "Cache limit reached. Some older memos are unavailable offline."
+                            else -> null
+                        }
+                        syncMessage?.let { StatusBanner(it, error = false) }
                         state.error?.let {
                             StatusBanner(it, error = true)
                         }
@@ -273,6 +292,9 @@ fun MemosPocketScreen(
                                     onBatterySettings,
                                     model::refresh,
                                     model::logout,
+                                    model::resolveConflict,
+                                    model::retryFailed,
+                                    model::requestSignIn,
                                 )
                             }
 
