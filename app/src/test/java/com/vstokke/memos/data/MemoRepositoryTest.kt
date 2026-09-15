@@ -11,6 +11,7 @@ import org.mockito.Mockito.*
 import java.time.Instant
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
 
 class MemoRepositoryTest {
     private val credentials = mock(CredentialStore::class.java)
@@ -112,6 +113,32 @@ class MemoRepositoryTest {
         verify(scheduler, times(2)).enqueueRepair()
     }
 
+    @Test fun `content-only task edit preserves metadata and queues exact source`() = runBlocking<Unit> {
+        val edited = repository.editContent(stored!!.summary(), memo, "- [x] done")
+
+        assertEquals("- [x] done", edited.content)
+        assertEquals(memo.visibility, edited.visibility)
+        assertEquals(memo.reminderTime, edited.reminderTime)
+        assertEquals(memo.pinned, edited.pinned)
+        assertEquals(memo.state, edited.state)
+        assertEquals(memo.space, edited.space)
+        assertEquals(memo, operations[memo.name]!!.base)
+        verify(scheduler).enqueueRepair()
+    }
+
+    @Test fun `content-only task edit rejects stale rendered snapshot`() = runBlocking<Unit> {
+        rows[memo.name] = memo.copy(content = "Changed locally", visibility = "PUBLIC")
+
+        val error = runCatching {
+            repository.editContent(stored!!.summary(), memo, "- [x] stale")
+        }.exceptionOrNull() as AppException
+
+        assertEquals(AppError.Conflict, error.error)
+        assertTrue(operations.isEmpty())
+        assertEquals("Changed locally", rows[memo.name]!!.content)
+        verifyNoInteractions(api)
+    }
+
     @Test fun `edit conflict never patches or changes cache`() = runBlocking<Unit> {
         rows[memo.name] = memo.copy(content = "Changed locally")
         val error = runCatching { repository.edit(stored!!.summary(), memo, MemoEdit("Draft", "PRIVATE", null)) }.exceptionOrNull() as AppException
@@ -205,6 +232,305 @@ class MemoRepositoryTest {
         order.verify(api).supportsMemoReminderTime("https://example.com", "access-two")
     }
 
+    @Test fun `second resource auth failure is visible but does not permanently require sign in`() = runBlocking<Unit> {
+        stored = Account(
+            "https://example.com",
+            "access-one",
+            "users/alice",
+            "Alice",
+            true,
+            AuthMethod.SESSION,
+            "refresh-one",
+            Instant.now().plusSeconds(900),
+        )
+        repository = MemoRepository(credentials, database, api, reminders, scheduler)
+        `when`(api.supportsMemoReminderTime("https://example.com", "access-one"))
+            .thenAnswer { throw AppException(AppError.Authentication) }
+        `when`(api.refreshSession("https://example.com", "refresh-one"))
+            .thenReturn(SessionTokens("access-two", Instant.now().plusSeconds(900), "refresh-two"))
+        val accessTwoAttempts = AtomicInteger()
+        `when`(api.supportsMemoReminderTime("https://example.com", "access-two"))
+            .thenAnswer { if (accessTwoAttempts.getAndIncrement() == 0) throw AppException(AppError.Authentication) else true }
+
+        val error = runCatching { repository.refresh() }.exceptionOrNull() as AppException
+
+        assertEquals(AppError.ResourceAuthentication, error.error)
+        assertFalse(repository.syncState.value.signInRequired)
+        assertTrue(repository.syncState.value.failed)
+        assertEquals("refresh-two", repository.account()!!.refreshToken)
+        verify(api, times(1)).refreshSession("https://example.com", "refresh-one")
+
+        repository.refresh()
+
+        assertFalse(repository.syncState.value.signInRequired)
+        assertFalse(repository.syncState.value.failed)
+        verify(api, times(2)).supportsMemoReminderTime(anyValue(), eqValue("access-two"))
+    }
+
+    @Test fun `upload auth failure also gets one refresh retry without an auth latch`() = runBlocking<Unit> {
+        stored = Account(
+            "https://example.com",
+            "access-one",
+            "users/alice",
+            "Alice",
+            true,
+            AuthMethod.SESSION,
+            "refresh-one",
+            Instant.now().plusSeconds(900),
+        )
+        repository = MemoRepository(credentials, database, api, reminders, scheduler)
+        repository.edit(stored!!.summary(), memo, MemoEdit("Local", "PRIVATE", memo.reminderTime))
+        `when`(api.getMemo(anyValue(), eqValue(memo.name))).thenReturn(memo)
+        val applyAttempts = AtomicInteger()
+        `when`(api.applyDesired(anyValue(), anyValue(), anyValue()))
+            .thenAnswer {
+                if (applyAttempts.getAndIncrement() < 2) throw AppException(AppError.Authentication)
+                it.getArgument<Memo>(2)
+            }
+        `when`(api.refreshSession("https://example.com", "refresh-one"))
+            .thenReturn(SessionTokens("access-two", Instant.now().plusSeconds(900), "refresh-two"))
+
+        val error = runCatching { repository.refresh() }.exceptionOrNull() as AppException
+
+        assertEquals(AppError.ResourceAuthentication, error.error)
+        assertFalse(repository.syncState.value.signInRequired)
+        assertTrue(repository.syncState.value.failed)
+        assertEquals(MemoSyncStatus.PENDING, operations[memo.name]!!.status)
+        verify(api, times(1)).refreshSession("https://example.com", "refresh-one")
+        verify(api, times(2)).applyDesired(anyValue(), anyValue(), anyValue())
+
+        repository.refresh()
+
+        assertTrue(operations.isEmpty())
+        assertFalse(repository.syncState.value.signInRequired)
+        verify(api, times(3)).applyDesired(anyValue(), anyValue(), anyValue())
+    }
+
+    @Test fun `legacy session auth latch recovers and clears after authenticated validation`() = runBlocking<Unit> {
+        stored = Account(
+            "https://example.com",
+            "access-one",
+            "users/alice",
+            "Alice",
+            true,
+            AuthMethod.SESSION,
+            "refresh-one",
+            Instant.now().plusSeconds(900),
+        )
+        metadata["auth_required"] = "true"
+        repository = MemoRepository(credentials, database, api, reminders, scheduler)
+
+        repository.refresh()
+
+        assertFalse(repository.syncState.value.signInRequired)
+        assertEquals("false", metadata["auth_required"])
+        assertEquals("", metadata["auth_required_reason"])
+        verify(api).supportsMemoReminderTime("https://example.com", "access-one")
+    }
+
+    @Test fun `failed activation preserves prior account cache owner and local writes`() = runBlocking<Unit> {
+        val previous = stored!!
+        val replacement = SignedInSession(
+            User("users/bob", "bob", "Bob"),
+            SessionTokens("new-access", Instant.now().plusSeconds(900), "new-refresh"),
+        )
+        `when`(api.signInWithPassword(anyValue(), anyValue(), anyValue())).thenReturn(replacement)
+        val saveAttempts = AtomicInteger()
+        doAnswer {
+            stored = it.getArgument(0)
+            if (saveAttempts.getAndIncrement() == 0) throw AppException(AppError.CredentialPersistence)
+            null
+        }.`when`(credentials).save(anyValue())
+
+        val error = runCatching {
+            repository.signInWithPassword("https://example.com", "bob", "not-persisted")
+        }.exceptionOrNull() as AppException
+
+        assertEquals(AppError.CredentialPersistence, error.error)
+        assertEquals(previous.userName, repository.account()!!.userName)
+        assertEquals(previous.userName, credentials.load()!!.userName)
+        assertEquals("https://example.com" + '\n' + "users/alice", metadata["owner"])
+        assertEquals(memo, repository.feed.value.single())
+        verify(reminders, never()).clearReminders()
+        verify(database, never()).clearAll()
+        repository.edit(previous.summary(), memo, MemoEdit("Still local", "PRIVATE", memo.reminderTime))
+        assertEquals("Still local", rows[memo.name]!!.content)
+        operations.clear()
+
+        // A later successful activation is a consistent owner transition, and logout cannot
+        // resurrect the failed account after that transition.
+        doAnswer { stored = it.getArgument(0); null }.`when`(credentials).save(anyValue())
+        repository.signInWithPassword("https://example.com", "bob", "not-persisted")
+        assertEquals("users/bob", repository.account()!!.userName)
+        assertTrue(repository.feed.value.isEmpty())
+        assertEquals("https://example.com" + '\n' + "users/bob", metadata["owner"])
+        repository.logout()
+        assertNull(repository.account())
+        assertNull(credentials.load())
+    }
+
+    @Test fun `failed activation rollback stays pending across store mutation and restoration failure`() = runBlocking<Unit> {
+        val previous = stored!!
+        val replacement = SignedInSession(
+            User("users/bob", "bob", "Bob"),
+            SessionTokens("new-access", Instant.now().plusSeconds(900), "new-refresh"),
+        )
+        `when`(api.signInWithPassword(anyValue(), anyValue(), anyValue())).thenReturn(replacement)
+        val saveAttempts = AtomicInteger()
+        doAnswer {
+            val candidate = it.getArgument<Account>(0)
+            when (saveAttempts.getAndIncrement()) {
+                0 -> {
+                    // Failed B commit updates the store's in-memory view first.
+                    stored = candidate
+                    throw AppException(AppError.CredentialPersistence)
+                }
+                1, 2 -> throw AppException(AppError.CredentialPersistence)
+                else -> {
+                    stored = candidate
+                    null
+                }
+            }
+        }.`when`(credentials).save(anyValue())
+
+        val activationError = runCatching {
+            repository.signInWithPassword("https://example.com", "bob", "not-persisted")
+        }.exceptionOrNull() as AppException
+
+        assertEquals(AppError.CredentialPersistence, activationError.error)
+        assertEquals("users/bob", credentials.load()!!.userName)
+        assertEquals(previous.userName, repository.account()!!.userName)
+        assertEquals("https://example.com" + '\n' + "users/alice", metadata["owner"])
+        assertEquals(memo, repository.feed.value.single())
+        verify(database, never()).clearAll()
+        repository.edit(previous.summary(), memo, MemoEdit("Safe local edit", "PRIVATE", memo.reminderTime))
+        assertEquals("Safe local edit", rows[memo.name]!!.content)
+        val wrongExpected = previous.summary().copy(userName = "users/bob")
+        val identityError = runCatching {
+            repository.edit(wrongExpected, rows[memo.name]!!, MemoEdit("Wrong owner", "PRIVATE", memo.reminderTime))
+        }.exceptionOrNull() as AppException
+        assertEquals(AppError.Authentication, identityError.error)
+
+        val retryError = runCatching { repository.refresh() }.exceptionOrNull() as AppException
+        assertEquals(AppError.CredentialPersistence, retryError.error)
+        assertFalse(repository.syncState.value.signInRequired)
+        // Restoration failed before changing the store, so the pending A save blocks the profile.
+        verify(api, never()).supportsMemoReminderTime(anyValue(), anyValue())
+        verify(api, never()).refreshSession(anyValue(), anyValue())
+
+        clearInvocations(api, credentials)
+        repository.refresh()
+        val order = inOrder(credentials, api)
+        order.verify(credentials).save(anyValue())
+        order.verify(api).supportsMemoReminderTime("https://example.com", "secret")
+        assertEquals(previous.userName, credentials.load()!!.userName)
+        assertEquals(previous.userName, repository.account()!!.userName)
+    }
+
+    @Test fun `failed same-owner reauthentication preserves active account and cache`() = runBlocking<Unit> {
+        val previous = stored!!
+        val replacement = SignedInSession(
+            User("users/alice", "alice", "Alice"),
+            SessionTokens("new-access", Instant.now().plusSeconds(900), "new-refresh"),
+        )
+        `when`(api.signInWithPassword(anyValue(), anyValue(), anyValue())).thenReturn(replacement)
+        val saveAttempts = AtomicInteger()
+        doAnswer {
+            stored = it.getArgument(0)
+            if (saveAttempts.getAndIncrement() == 0) throw AppException(AppError.CredentialPersistence)
+            null
+        }.`when`(credentials).save(anyValue())
+
+        val error = runCatching {
+            repository.signInWithPassword("https://example.com", "alice", "not-persisted")
+        }.exceptionOrNull() as AppException
+
+        assertEquals(AppError.CredentialPersistence, error.error)
+        assertEquals(previous.userName, repository.account()!!.userName)
+        assertEquals(previous.userName, credentials.load()!!.userName)
+        assertEquals(memo, repository.feed.value.single())
+        verify(database, never()).clearAll()
+        repository.edit(previous.summary(), memo, MemoEdit("Still local", "PRIVATE", memo.reminderTime))
+        assertEquals("Still local", rows[memo.name]!!.content)
+    }
+
+    @Test fun `rejected refresh reason survives reconstruction and prevents retry`() = runBlocking<Unit> {
+        stored = Account("https://example.com", "", "users/alice", "Alice", true, AuthMethod.SESSION, "refresh-one")
+        repository = MemoRepository(credentials, database, api, reminders, scheduler)
+        `when`(api.refreshSession("https://example.com", "refresh-one"))
+            .thenAnswer { throw AppException(AppError.Authentication) }
+
+        val first = runCatching { repository.refresh() }.exceptionOrNull() as AppException
+
+        assertEquals(AppError.SessionRefreshRejected, first.error)
+        assertTrue(repository.syncState.value.signInRequired)
+        assertEquals("refresh_rejected", metadata["auth_required_reason"])
+        repository = MemoRepository(credentials, database, api, reminders, scheduler)
+        assertTrue(repository.syncState.value.signInRequired)
+        assertTrue(runCatching { repository.refresh() }.isFailure)
+        verify(api, times(1)).refreshSession("https://example.com", "refresh-one")
+        assertEquals(memo, repository.feed.value.single())
+    }
+
+    @Test fun `transient refresh failure remains recoverable after reconstruction`() = runBlocking<Unit> {
+        stored = Account("https://example.com", "", "users/alice", "Alice", true, AuthMethod.SESSION, "refresh-one")
+        repository = MemoRepository(credentials, database, api, reminders, scheduler)
+        `when`(api.refreshSession("https://example.com", "refresh-one"))
+            .thenAnswer { throw AppException(AppError.Network) }
+
+        assertEquals(AppError.Network, runCatching { repository.refresh() }.exceptionOrNull()?.let { (it as AppException).error })
+        assertFalse(repository.syncState.value.signInRequired)
+        repository = MemoRepository(credentials, database, api, reminders, scheduler)
+        doReturn(SessionTokens("access-two", Instant.now().plusSeconds(900), "refresh-two"))
+            .`when`(api).refreshSession("https://example.com", "refresh-one")
+
+        repository.refresh()
+
+        assertFalse(repository.syncState.value.signInRequired)
+        assertEquals("refresh-two", repository.account()!!.refreshToken)
+    }
+
+    @Test fun `failed credential save is a barrier until newest rotated credential is committed`() = runBlocking<Unit> {
+        stored = Account("https://example.com", "", "users/alice", "Alice", true, AuthMethod.SESSION, "refresh-one")
+        repository = MemoRepository(credentials, database, api, reminders, scheduler)
+        val rotated = SessionTokens("access-two", Instant.now().minusSeconds(60), "refresh-two")
+        val latest = SessionTokens("access-three", Instant.now().plusSeconds(900), "refresh-three")
+        doReturn(rotated).`when`(api).refreshSession("https://example.com", "refresh-one")
+        doReturn(latest).`when`(api).refreshSession("https://example.com", "refresh-two")
+        val saveAttempts = AtomicInteger()
+        doAnswer {
+            // Simulate SharedPreferences updating its in-memory values before commit reports
+            // failure, rather than modeling only a throw-before-mutation store.
+            stored = it.getArgument(0)
+            if (saveAttempts.getAndIncrement() < 2) throw AppException(AppError.CredentialPersistence)
+            null
+        }.`when`(credentials).save(anyValue())
+
+        val first = runCatching { repository.refresh() }.exceptionOrNull() as AppException
+        assertEquals(AppError.CredentialPersistence, first.error)
+        assertEquals("access-two", repository.account()!!.token)
+        verify(api).refreshSession("https://example.com", "refresh-one")
+        verify(api, never()).supportsMemoReminderTime(anyValue(), anyValue())
+
+        val second = runCatching { repository.refresh() }.exceptionOrNull() as AppException
+        assertEquals(AppError.CredentialPersistence, second.error)
+        // The retained access token is expired, but the pending save still blocks another rotation.
+        verify(api, times(1)).refreshSession("https://example.com", "refresh-one")
+        verify(api, never()).refreshSession("https://example.com", "refresh-two")
+        verify(api, never()).supportsMemoReminderTime(anyValue(), anyValue())
+
+        clearInvocations(api, credentials)
+        repository.refresh()
+
+        val order = inOrder(credentials, api)
+        order.verify(credentials).save(anyValue())
+        order.verify(api).refreshSession("https://example.com", "refresh-two")
+        order.verify(credentials).save(anyValue())
+        order.verify(api).supportsMemoReminderTime("https://example.com", "access-three")
+        assertEquals("refresh-three", repository.account()!!.refreshToken)
+        assertFalse(repository.syncState.value.signInRequired)
+    }
+
     @Test fun `offline refresh failure keeps session and does not ask for sign in`() = runBlocking<Unit> {
         stored = Account("https://example.com", "", "users/alice", "Alice", true, AuthMethod.SESSION, "refresh-one")
         repository = MemoRepository(credentials, database, api, reminders, scheduler)
@@ -228,7 +554,7 @@ class MemoRepositoryTest {
 
         val error = runCatching { repository.refresh() }.exceptionOrNull() as AppException
 
-        assertEquals(AppError.Authentication, error.error)
+        assertEquals(AppError.SessionRefreshRejected, error.error)
         assertTrue(repository.syncState.value.signInRequired)
         assertEquals(memo, repository.feed.value.single())
         verify(database, never()).clearAll()
@@ -243,12 +569,366 @@ class MemoRepositoryTest {
         verify(database, never()).applyScan(anyValue(), anyValue(), anyLong(), anyBoolean(), anyValue())
     }
 
+    @Test fun `plain pending upload is not stranded by capability discovery failure`() = runBlocking<Unit> {
+        repository.edit(stored!!.summary(), memo, MemoEdit("Uploaded first", "PRIVATE", memo.reminderTime))
+        `when`(api.getMemo(anyValue(), eqValue(memo.name))).thenReturn(memo)
+        `when`(api.applyDesired(anyValue(), anyValue(), anyValue())).thenAnswer { it.getArgument<Memo>(2) }
+        `when`(api.supportsMemoReminderTime(anyValue(), anyValue())).thenAnswer {
+            throw AppException(AppError.Network)
+        }
+
+        assertTrue(runCatching { repository.refresh() }.exceptionOrNull() is AppException)
+
+        verify(api).applyDesired(anyValue(), anyValue(), anyValue())
+        assertTrue(operations.isEmpty())
+        assertNotNull(repository.syncState.value.lastUploadAckAt)
+        verify(database, never()).applyScan(anyValue(), anyValue(), anyLong(), anyBoolean(), anyValue())
+    }
+
     @Test fun `interrupted pull or token cycle never prunes cache`() = runBlocking<Unit> {
         `when`(api.listPage(anyValue(), anyValue(), nullable(String::class.java), nullable(String::class.java), anyInt()))
             .thenReturn(MemoPage(listOf(memo), "loop"))
         assertTrue(runCatching { repository.refresh() }.exceptionOrNull() is AppException)
         verify(database, never()).applyScan(anyValue(), anyValue(), anyLong(), anyBoolean(), anyValue())
         assertEquals(memo, rows[memo.name])
+    }
+
+    @Test fun `bounded sync turn reports more work instead of following unique page tokens forever`() = runBlocking<Unit> {
+        val pages = AtomicInteger()
+        `when`(api.listPage(anyValue(), anyValue(), nullable(String::class.java), nullable(String::class.java), anyInt()))
+            .thenAnswer {
+                val number = pages.incrementAndGet()
+                MemoPage(emptyList(), "unique-$number")
+            }
+
+        val result = repository.syncTurn()
+
+        assertTrue(result.moreWork)
+        assertTrue(pages.get() in 100..128)
+        verify(database, never()).applyScan(anyValue(), anyValue(), anyLong(), anyBoolean(), anyValue())
+        assertFalse(repository.syncState.value.syncing)
+    }
+
+    @Test fun `resumed bounded scan advances its cursor instead of repeating the first page prefix`() = runBlocking<Unit> {
+        val pages = AtomicInteger()
+        `when`(api.listPage(anyValue(), anyValue(), nullable(String::class.java), nullable(String::class.java), anyInt()))
+            .thenAnswer {
+                val number = pages.incrementAndGet()
+                if (number < 130) MemoPage(emptyList(), "cursor-$number") else MemoPage(emptyList(), null)
+            }
+
+        val first = repository.syncTurn()
+        val firstCount = pages.get()
+        assertTrue(first.moreWork)
+        assertEquals(127, firstCount)
+
+        val second = repository.syncTurn()
+        assertTrue("the resumed turn must request the page after the saved cursor", pages.get() > firstCount)
+        assertTrue(second.pullCompleted)
+        assertFalse(second.moreWork)
+    }
+
+    @Test fun `conflict and failed rows do not count as eligible more work`() = runBlocking<Unit> {
+        operations[memo.name] = PendingMemo(
+            desired = memo, base = memo, deleted = false, revision = 1L,
+            sent = null, sentDeleted = false, status = MemoSyncStatus.CONFLICT, server = memo,
+        )
+
+        val result = repository.syncTurn()
+
+        assertFalse(result.moreWork)
+    }
+
+    @Test fun `targeted fence budget resumes at the next fence`() = runBlocking<Unit> {
+        val fences = (1..9).map { index ->
+            val acknowledged = memo.copy(name = "memos/fence-$index", content = "ack-$index", snippet = "ack-$index")
+            SyncFence(acknowledged.name, index.toLong(), acknowledged, deleted = false)
+        }
+        val scan = ScanSnapshot(0L, fences)
+        `when`(database.beginScan()).thenReturn(scan)
+        `when`(database.fences()).thenReturn(fences)
+        `when`(api.listPage(anyValue(), anyValue(), nullable(String::class.java), nullable(String::class.java), anyInt()))
+            .thenReturn(MemoPage(emptyList(), null))
+        `when`(api.getMemo(anyValue(), anyValue())).thenAnswer { call ->
+            fences.first { it.name == call.getArgument<String>(1) }.snapshot
+        }
+
+        val first = repository.syncTurn()
+        assertTrue(first.moreWork)
+        verify(api, times(8)).getMemo(anyValue(), anyValue())
+
+        val second = repository.syncTurn()
+        assertTrue(second.pullCompleted)
+        verify(api, times(9)).getMemo(anyValue(), anyValue())
+    }
+
+    @Test fun `save queued during a feed page is uploaded at the page boundary`() = runBlocking<Unit> {
+        val entered = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        val pages = AtomicInteger()
+        `when`(api.listPage(anyValue(), anyValue(), nullable(String::class.java), nullable(String::class.java), anyInt()))
+            .thenAnswer {
+                if (pages.incrementAndGet() == 1) {
+                    entered.countDown()
+                    check(release.await(5, TimeUnit.SECONDS))
+                }
+                MemoPage(emptyList(), null)
+            }
+        doAnswer {
+            val account = it.getArgument<Account>(0)
+            val draft = it.getArgument<NewMemo>(1)
+            val id = it.getArgument<String>(2)
+            CreatedMemoResult(
+                Memo("memos/$id", draft.content, draft.content, draft.visibility, Instant.now(), null,
+                    draft.reminderTime, account.userName, space = draft.space),
+                true,
+            )
+        }.`when`(api).createMemo(anyValue(), anyValue(), anyValue())
+
+        val sync = async(Dispatchers.Default) { repository.syncTurn() }
+        assertTrue(entered.await(5, TimeUnit.SECONDS))
+        val queued = repository.create(stored!!.summary(), NewMemo("mid-page", null)).memo
+        release.countDown()
+        val result = sync.await()
+
+        assertTrue(result.pushProgress)
+        assertTrue(operations.isEmpty())
+        verify(api).createMemo(anyValue(), anyValue(), eqValue(queued.name.substringAfter('/')))
+    }
+
+    @Test fun `upload budget counts selected attempts and yields before pulling`() = runBlocking<Unit> {
+        val entered = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        val pages = AtomicInteger()
+        `when`(api.listPage(anyValue(), anyValue(), nullable(String::class.java), nullable(String::class.java), anyInt()))
+            .thenAnswer {
+                val page = pages.incrementAndGet()
+                if (page == 40) {
+                    entered.countDown()
+                    check(release.await(5, TimeUnit.SECONDS))
+                }
+                MemoPage(emptyList(), "page-$page".takeIf { page < 41 })
+            }
+        doAnswer {
+            val account = it.getArgument<Account>(0)
+            val draft = it.getArgument<NewMemo>(1)
+            val id = it.getArgument<String>(2)
+            CreatedMemoResult(
+                Memo("memos/$id", draft.content, draft.content, draft.visibility, Instant.now(), null,
+                    draft.reminderTime, account.userName, space = draft.space), true,
+            )
+        }.`when`(api).createMemo(anyValue(), anyValue(), anyValue())
+
+        val sync = async(Dispatchers.Default) { repository.syncTurn() }
+        assertTrue(entered.await(5, TimeUnit.SECONDS))
+        val queued = repository.create(stored!!.summary(), NewMemo("after-budget", null)).memo
+        release.countDown()
+        val result = sync.await()
+
+        assertTrue(result.pushProgress)
+        assertTrue(operations.isEmpty())
+        verify(api).createMemo(anyValue(), anyValue(), eqValue(queued.name.substringAfter('/')))
+    }
+
+    @Test fun `completed page cursor survives a boundary upload failure`() = runBlocking<Unit> {
+        val entered = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        val normalPages = AtomicInteger()
+        val applyAttempts = AtomicInteger()
+        val archivedSeen = AtomicInteger()
+        `when`(database.beginScan()).thenReturn(ScanSnapshot(0L, emptyList()))
+        `when`(api.listPage(anyValue(), anyValue(), nullable(String::class.java), nullable(String::class.java), anyInt()))
+            .thenAnswer { call ->
+                val state = call.getArgument<String>(1)
+                val token = call.getArgument<String?>(2)
+                when {
+                    state == "NORMAL" && token == null -> {
+                        normalPages.incrementAndGet()
+                        MemoPage(emptyList(), "normal-next")
+                    }
+                    state == "NORMAL" && token == "normal-next" -> {
+                        normalPages.incrementAndGet()
+                        entered.countDown()
+                        check(release.await(5, TimeUnit.SECONDS))
+                        MemoPage(emptyList(), null)
+                    }
+                    state == "ARCHIVED" && token == null -> {
+                        archivedSeen.incrementAndGet()
+                        MemoPage(emptyList(), null)
+                    }
+                    else -> error("unexpected page state=$state token=$token")
+                }
+            }
+        `when`(api.getMemo(anyValue(), eqValue(memo.name))).thenReturn(memo)
+        `when`(api.applyDesired(anyValue(), anyValue(), anyValue())).thenAnswer { call ->
+            if (applyAttempts.incrementAndGet() == 1) throw AppException(AppError.Network)
+            call.getArgument<Memo>(2)
+        }
+
+        val syncScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+        val sync = syncScope.async { repository.syncTurn() }
+        assertTrue(entered.await(5, TimeUnit.SECONDS))
+        repository.edit(stored!!.summary(), memo, MemoEdit("queued", memo.visibility, memo.reminderTime))
+        release.countDown()
+        assertTrue(runCatching { sync.await() }.isFailure)
+        syncScope.cancel()
+
+        val resumedOutcome = runCatching { repository.syncTurn() }
+        val resumed = resumedOutcome.getOrThrow()
+        assertTrue(resumed.pullCompleted)
+        assertEquals(2, normalPages.get())
+        assertEquals(1, archivedSeen.get())
+        assertTrue(operations.isEmpty())
+    }
+
+    @Test fun `spaces failure happens after pending push and cannot gate it`() = runBlocking<Unit> {
+        repository.edit(stored!!.summary(), memo, MemoEdit("pushed", "PRIVATE", memo.reminderTime))
+        `when`(api.getMemo(anyValue(), eqValue(memo.name))).thenReturn(memo)
+        `when`(api.applyDesired(anyValue(), anyValue(), anyValue())).thenAnswer { it.getArgument<Memo>(2) }
+        doAnswer { throw AppException(AppError.Network) }.`when`(api).listSpacesPage(anyValue(), nullable(String::class.java), anyInt())
+
+        assertTrue(runCatching { repository.refresh() }.isFailure)
+
+        val order = inOrder(api)
+        order.verify(api).getMemo(anyValue(), eqValue(memo.name))
+        order.verify(api).applyDesired(anyValue(), anyValue(), anyValue())
+        order.verify(api).supportsMemoReminderTime(anyValue(), anyValue())
+        order.verify(api).listSpacesPage(anyValue(), nullable(String::class.java), anyInt())
+        assertTrue(operations.isEmpty())
+        assertEquals(AppError.Network, repository.syncState.value.pullError)
+    }
+
+    @Test fun `feed page failure happens after pending push and leaves scan uncommitted`() = runBlocking<Unit> {
+        repository.edit(stored!!.summary(), memo, MemoEdit("pushed", "PRIVATE", memo.reminderTime))
+        `when`(api.getMemo(anyValue(), eqValue(memo.name))).thenReturn(memo)
+        `when`(api.applyDesired(anyValue(), anyValue(), anyValue())).thenAnswer { it.getArgument<Memo>(2) }
+        `when`(api.listSpacesPage(anyValue(), nullable(String::class.java), anyInt()))
+            .thenReturn(com.vstokke.memos.domain.SpacePage(emptyList(), null))
+        doAnswer { throw AppException(AppError.Network) }.`when`(api)
+            .listPage(anyValue(), anyValue(), nullable(String::class.java), nullable(String::class.java), anyInt())
+
+        assertTrue(runCatching { repository.refresh() }.isFailure)
+
+        val order = inOrder(api)
+        order.verify(api).getMemo(anyValue(), eqValue(memo.name))
+        order.verify(api).applyDesired(anyValue(), anyValue(), anyValue())
+        order.verify(api).supportsMemoReminderTime(anyValue(), anyValue())
+        order.verify(api).listSpacesPage(anyValue(), nullable(String::class.java), anyInt())
+        order.verify(api).listPage(anyValue(), eqValue("NORMAL"), isNull(), isNull(), eqValue(1_000))
+        assertTrue(operations.isEmpty())
+        verify(database, never()).applyScan(anyValue(), anyValue(), anyLong(), anyBoolean(), anyValue())
+    }
+
+    @Test fun `stale fenced list item is revalidated and passed to atomic scan merge`() = runBlocking<Unit> {
+        val acknowledged = memo.copy(content = "acknowledged", updateTime = Instant.now())
+        val stale = memo.copy(content = "stale list")
+        val fence = SyncFence(memo.name, 4L, acknowledged, deleted = false)
+        val scan = ScanSnapshot(0L, listOf(fence))
+        `when`(database.beginScan()).thenReturn(scan)
+        `when`(database.fences()).thenReturn(listOf(fence))
+        `when`(api.listSpacesPage(anyValue(), nullable(String::class.java), anyInt()))
+            .thenReturn(com.vstokke.memos.domain.SpacePage(emptyList(), null))
+        val pages = AtomicInteger()
+        `when`(api.listPage(anyValue(), anyValue(), nullable(String::class.java), nullable(String::class.java), anyInt()))
+            .thenAnswer { if (pages.incrementAndGet() == 1) MemoPage(listOf(stale), null) else MemoPage(emptyList(), null) }
+        `when`(api.getMemo(anyValue(), eqValue(memo.name))).thenReturn(acknowledged)
+
+        val result = repository.syncTurn()
+
+        assertTrue(result.pullCompleted)
+        verify(api, times(1)).getMemo(anyValue(), eqValue(memo.name))
+        verify(database).applyScan(
+            anyValue(), anyValue(), anyLong(), eqValue(false), anyValue(), eqValue(scan),
+            eqValue(mapOf(memo.name to acknowledged)),
+        )
+    }
+
+    @Test fun `cancelled scan leaves a newly queued outbox row and logout clears it`() = runBlocking<Unit> {
+        val entered = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        `when`(api.listSpacesPage(anyValue(), nullable(String::class.java), anyInt())).thenAnswer {
+            entered.countDown()
+            check(release.await(5, TimeUnit.SECONDS))
+            throw CancellationException("test cancellation")
+        }
+        val sync = launch(Dispatchers.Default) { repository.syncTurn() }
+        assertTrue(entered.await(5, TimeUnit.SECONDS))
+        repository.create(stored!!.summary(), NewMemo("cancelled", null))
+        sync.cancel()
+        release.countDown()
+        sync.join()
+        assertTrue(operations.isNotEmpty())
+        verify(database, never()).applyScan(anyValue(), anyValue(), anyLong(), anyBoolean(), anyValue())
+        repository.logout()
+        assertTrue(operations.isEmpty())
+        assertNull(repository.account())
+        verify(database).clearAll()
+    }
+
+    @Test fun `resource authentication rotates once across a resumed page turn`() = runBlocking<Unit> {
+        stored = Account(
+            "https://example.com", "access-one", "users/alice", "Alice", true,
+            AuthMethod.SESSION, "refresh-one", Instant.now().plusSeconds(900),
+        )
+        repository = MemoRepository(credentials, database, api, reminders, scheduler)
+        val pageAttempts = AtomicInteger()
+        `when`(api.supportsMemoReminderTime(anyValue(), anyValue())).thenReturn(true)
+        `when`(api.refreshSession("https://example.com", "refresh-one"))
+            .thenReturn(SessionTokens("access-two", Instant.now().plusSeconds(900), "refresh-two"))
+        `when`(api.listPage(anyValue(), anyValue(), nullable(String::class.java), nullable(String::class.java), anyInt()))
+            .thenAnswer {
+                if (pageAttempts.incrementAndGet() <= 2) throw AppException(AppError.Authentication)
+                MemoPage(emptyList(), null)
+            }
+
+        val first = runCatching { repository.syncTurn() }.exceptionOrNull() as AppException
+
+        assertEquals(AppError.ResourceAuthentication, first.error)
+        assertFalse(repository.syncState.value.signInRequired)
+        verify(api, times(1)).refreshSession("https://example.com", "refresh-one")
+        val resumed = repository.syncTurn()
+        assertTrue(resumed.pullCompleted)
+        verify(api, times(1)).refreshSession("https://example.com", "refresh-one")
+    }
+
+    @Test fun `matching fenced list item retires without targeted GET`() = runBlocking<Unit> {
+        val acknowledged = memo.copy(content = "acknowledged", updateTime = Instant.now())
+        val fence = SyncFence(memo.name, 5L, acknowledged, deleted = false)
+        val scan = ScanSnapshot(0L, listOf(fence))
+        `when`(database.beginScan()).thenReturn(scan)
+        `when`(database.fences()).thenReturn(listOf(fence))
+        `when`(api.listSpacesPage(anyValue(), nullable(String::class.java), anyInt()))
+            .thenReturn(com.vstokke.memos.domain.SpacePage(emptyList(), null))
+        val pages = AtomicInteger()
+        `when`(api.listPage(anyValue(), anyValue(), nullable(String::class.java), nullable(String::class.java), anyInt()))
+            .thenAnswer { if (pages.incrementAndGet() == 1) MemoPage(listOf(acknowledged), null) else MemoPage(emptyList(), null) }
+
+        repository.syncTurn()
+
+        verify(api, never()).getMemo(anyValue(), anyValue())
+        verify(database).applyScan(
+            anyValue(), anyValue(), anyLong(), eqValue(false), anyValue(), eqValue(scan),
+            eqValue(mapOf(memo.name to acknowledged)),
+        )
+    }
+
+    @Test fun `complete absence corroborates deletion fence without GET`() = runBlocking<Unit> {
+        val fence = SyncFence(memo.name, 6L, null, deleted = true)
+        val scan = ScanSnapshot(0L, listOf(fence))
+        `when`(database.beginScan()).thenReturn(scan)
+        `when`(database.fences()).thenReturn(listOf(fence))
+        `when`(api.listSpacesPage(anyValue(), nullable(String::class.java), anyInt()))
+            .thenReturn(com.vstokke.memos.domain.SpacePage(emptyList(), null))
+        `when`(api.listPage(anyValue(), anyValue(), nullable(String::class.java), nullable(String::class.java), anyInt()))
+            .thenReturn(MemoPage(emptyList(), null))
+
+        repository.syncTurn()
+
+        verify(api, never()).getMemo(anyValue(), anyValue())
+        verify(database).applyScan(
+            anyValue(), anyValue(), anyLong(), eqValue(false), anyValue(), eqValue(scan),
+            eqValue(mapOf<String, Memo?>(memo.name to null)),
+        )
     }
 
     @Test fun `operation carrying old account identity cannot write to new account`() = runBlocking<Unit> {

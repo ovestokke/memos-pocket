@@ -41,13 +41,28 @@ class OfflineDatabaseTest {
                 db.version = version
             }
             AppDatabase(context, "offline-test.db").use { db ->
-                assertEquals(3, db.readableDatabase.version)
+                assertEquals(4, db.readableDatabase.version)
                 assertEquals("kept", db.feed().single().content)
                 assertEquals(1, db.reminderRecords().size)
                 assertTrue(db.pendingDue(Instant.parse("2027-01-01T00:00:01Z"), 60).isEmpty())
                 assertTrue(db.pending().isEmpty())
                 db.clearAll()
             }
+        }
+    }
+
+    @Test fun acknowledgementFenceRollbackLeavesOutboxAndDesiredViewIntact() = withDatabase { db ->
+        db.queue(memo.copy(content = "local"), memo)
+        val operation = db.pending().single()
+        db.writableDatabase.execSQL(
+            "CREATE TEMP TRIGGER fail_fence BEFORE INSERT ON memo_sync_fences BEGIN SELECT RAISE(ABORT, 'test rollback'); END",
+        )
+        try {
+            assertTrue(runCatching { db.acknowledge(operation, operation.desired.copy(content = "server")) }.isFailure)
+            assertEquals("local", db.pending().single().desired.content)
+            assertTrue(db.fences().isEmpty())
+        } finally {
+            db.writableDatabase.execSQL("DROP TRIGGER fail_fence")
         }
     }
 
@@ -194,5 +209,54 @@ class OfflineDatabaseTest {
         db.resolve(memo.name, null)
         db.applyScan(emptyList(), emptyList(), pruneCandidates = emptySet())
         assertEquals(listOf(memo), db.feed())
+    }
+
+    @Test fun ackFenceSurvivesReopenAndProtectsAgainstStaleList() = withDatabase { db ->
+        db.queue(memo.copy(content = "local"), memo)
+        val operation = db.pending().single()
+        db.markSent(operation)
+        val acknowledged = operation.desired.copy(content = "server", updateTime = Instant.now())
+        db.acknowledge(operation, acknowledged)
+        assertEquals(1, db.fences().size)
+
+        AppDatabase(context, "offline-test.db").use { reopened ->
+            assertEquals(acknowledged, reopened.fences().single().snapshot)
+            val scan = reopened.beginScan()
+            reopened.applyScan(
+                listOf(memo.copy(content = "stale list")), emptyList(),
+                pruneCandidates = emptySet(), scan = scan,
+            )
+            assertEquals(acknowledged, reopened.feed().single())
+            assertEquals(1, reopened.fences().size)
+        }
+    }
+
+    @Test fun ackFenceIsRetiredOnlyAfterAuthoritativeCorroboration() = withDatabase { db ->
+        db.queue(memo.copy(content = "local"), memo)
+        val operation = db.pending().single()
+        db.markSent(operation)
+        val acknowledged = operation.desired.copy(content = "server", updateTime = Instant.now())
+        db.acknowledge(operation, acknowledged)
+        val scan = db.beginScan()
+        db.applyScan(
+            listOf(acknowledged), emptyList(), pruneCandidates = emptySet(), scan = scan,
+            verifiedFences = mapOf(memo.name to acknowledged),
+        )
+        assertTrue(db.fences().isEmpty())
+        assertEquals(acknowledged, db.feed().single())
+    }
+
+    @Test fun deletionFenceDoesNotResurrectFromStaleListAndRetiresOn404() = withDatabase { db ->
+        db.queue(memo.copy(content = "local"), memo, deleted = true)
+        val operation = db.pending().single()
+        db.markSent(operation)
+        db.acknowledge(operation, null)
+        val scan = db.beginScan()
+        db.applyScan(
+            listOf(memo), emptyList(), pruneCandidates = emptySet(), scan = scan,
+            verifiedFences = mapOf(memo.name to null),
+        )
+        assertTrue(db.feed().isEmpty())
+        assertTrue(db.fences().isEmpty())
     }
 }

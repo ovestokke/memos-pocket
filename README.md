@@ -6,14 +6,15 @@ An unofficial Android client for [Memos](https://www.usememos.com/). The app is 
 
 - HTTPS server discovery, username/password and provider-neutral OAuth sign-in, with PKCE and Keystore-encrypted rotating sessions.
 - Offline-first normal, archived and Space feeds with complete locally cached Markdown and pinned-first ordering.
+- CommonMark/GFM Markdown rendering for headings, emphasis, strong, strikethrough, nested lists, interactive owner task checkboxes, code, block quotes, safe links, tables and thematic breaks; task insertion/continuation is available in both editor surfaces.
 - Member-space discovery, space-scoped feeds, remembered space selection and space memo creation.
 - Create, edit, pin/unpin, archive/restore, copy link/content and confirmed delete without `force`.
-- Durable local creates, edits, pin/archive actions and deletion requests; automatic network-constrained sync and manual conflict resolution.
+- Durable local creates, edits, pin/archive actions and deletion requests; immediate application-scoped sync with network-constrained WorkManager fallback and manual conflict resolution.
 - Compact Compose screens adapted from actual web-Memos colors and layouts, drawer/sidebar navigation, persistent system/light/dark theme.
 - Settings with account information, confirmed disconnect, Android notification/channel and exact-alarm controls, sync/alarm diagnostics and an explicit test notification.
 - Capability-controlled server reminders, local delivery ledger, stale reminder cleanup and background reconciliation.
 
-Still required: task toggles, moving existing memos between spaces, attachments, comments/relations/reactions, full sharing, search/filters/calendar/views, richer Markdown/editor support and remaining user preferences. Drafts survive rotation but are not persisted across process death.
+Remaining Markdown parity gaps are non-executing fallbacks for images and raw HTML plus literal source for math, diagrams, syntax highlighting, tags/mentions, previews, managed attachments and footnotes. Moving existing memos between spaces, attachments, comments/relations/reactions, full sharing, search/filters/calendar/views and remaining user preferences are still required. Drafts survive rotation but are not persisted across process death.
 
 ## Build
 
@@ -65,7 +66,7 @@ Settings distinguishes a direct Android test notification from server storage, s
 
 The app maintains a local reminder inventory and delivery ledger and schedules the next due alarm. It catches up reminders from the preceding 24 hours. Only successfully submitted notifications are acknowledged individually in the ledger. Unpublished items remain retryable after process death, with full timestamp precision. A crash after publication but before acknowledgment can repeat submission: stable notification IDs and only-alert-once reduce duplication, but exactly-once delivery across SQLite and Android is not guaranteed.
 
-WorkManager requests approximately 15-minute sync intervals, subject to Android/network/battery constraints; it does not guarantee that frequency. Inexact alarm fallback can be late. Force-stop prevents background work until reopening. Already synchronized reminders can be delivered offline, but external edits, clear, archive and delete are discovered only on a successful sync. These lifecycle cases still need device validation.
+The application coordinator wakes immediately after durable writes, manual Sync now, resume and network restoration. WorkManager requests approximately 15-minute sync intervals and keeps a CONNECTED-constrained, coalesced retry fallback, subject to Android/network/battery constraints; neither background frequency nor immediate reachability is guaranteed. Inexact alarm fallback can be late. Force-stop prevents background work until reopening. Already synchronized reminders can be delivered offline, but external edits, clear, archive and delete are discovered only on a successful sync. These lifecycle cases still need device validation.
 
 ## API and safety
 
@@ -83,4 +84,4 @@ TLS verification, redirect blocking, HTTPS-only input, backup exclusion and priv
 
 ## Validation
 
-77 JVM tests and 14 real-SQLite/device tests pass with no failures or skips. The device suite covers v1/v2 database upgrades, transaction rollback, reopen persistence, tombstones, conflicts, cache limits and reminder delivery deduplication in the isolated debug package. Lint, debug/release APK builds and the release bundle pass under JDK 17. Repository tests otherwise use mocks, and ViewModel tests do not exercise Compose layout. Live offline CRUD/reconnect races, notification delivery and end-to-end browser SSO remain device acceptance work; passing builds are not proof of those behaviors.
+JVM unit tests, lint and the debug APK build are run under JDK 17. Android SQLite tests cover migrations, transaction rollback, reopen persistence, fences, cache limits and reminder delivery, but are compile-checked only in this environment and have not been installed or run on a device. Repository tests otherwise use mocks, and ViewModel tests do not exercise Compose layout. Live offline CRUD/reconnect races, notification delivery and end-to-end browser SSO remain device acceptance work; passing builds are not proof of those behaviors.

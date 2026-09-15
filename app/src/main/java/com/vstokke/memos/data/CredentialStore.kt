@@ -6,6 +6,8 @@ import android.security.keystore.KeyProperties
 import android.util.Base64
 import androidx.core.content.edit
 import com.vstokke.memos.domain.Account
+import com.vstokke.memos.domain.AppError
+import com.vstokke.memos.domain.AppException
 import com.vstokke.memos.domain.AuthMethod
 import com.vstokke.memos.domain.PendingOAuth
 import org.json.JSONObject
@@ -38,19 +40,34 @@ class CredentialStore(context: Context) {
         )
     }
 
+    /**
+     * Saves the credential synchronously so a rotated refresh token is committed before it is used.
+     * The plaintext credential is never included in persistence errors.
+     */
     fun save(account: Account) {
         val credential = when (account.authMethod) {
             AuthMethod.PERSONAL_ACCESS_TOKEN -> account.token
             AuthMethod.SESSION -> account.refreshToken.orEmpty()
         }
         require(credential.isNotBlank())
-        preferences.edit {
-            putString(KEY_URL, account.baseUrl)
-            putString(KEY_USER, account.userName)
-            putString(KEY_DISPLAY, account.displayName)
-            putBoolean(KEY_MEMO_REMINDERS, account.supportsMemoReminderTime)
-            putString(KEY_AUTH_METHOD, account.authMethod.name)
-            putString(KEY_TOKEN, encrypt(credential))
+        val encrypted = try {
+            encrypt(credential)
+        } catch (_: Exception) {
+            throw AppException(AppError.CredentialPersistence)
+        }
+        try {
+            val editor = preferences.edit()
+                .putString(KEY_URL, account.baseUrl)
+                .putString(KEY_USER, account.userName)
+                .putString(KEY_DISPLAY, account.displayName)
+                .putBoolean(KEY_MEMO_REMINDERS, account.supportsMemoReminderTime)
+                .putString(KEY_AUTH_METHOD, account.authMethod.name)
+                .putString(KEY_TOKEN, encrypted)
+            if (!editor.commit()) throw AppException(AppError.CredentialPersistence)
+        } catch (error: AppException) {
+            throw error
+        } catch (_: Exception) {
+            throw AppException(AppError.CredentialPersistence)
         }
     }
 

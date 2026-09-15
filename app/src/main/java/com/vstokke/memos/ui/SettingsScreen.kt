@@ -79,15 +79,24 @@ fun SettingsScreen(
         if (state.sync.pending == 1) "change" else "changes"
     val syncStatus = when {
         state.sync.signInRequired -> "Sign in"
+        state.sync.pushError != null -> "Upload failed"
+        state.sync.pullError != null -> "Refresh failed"
+        state.sync.conflicts > 0 -> "Conflict"
+        state.sync.failedCount > 0 -> "Failed"
         state.sync.syncing -> "Syncing"
-        state.sync.failed -> "Failed"
         state.sync.pending > 0 -> "Waiting"
         else -> "Ready"
     }
     val syncDescription = when {
         state.sync.signInRequired -> "Sync is paused. Local memos and changes stay on this device."
-        state.sync.syncing -> "$pendingLabel waiting. Checking the server now."
-        state.sync.failed -> "The last sync did not finish. Local work is safe."
+        state.sync.pushError != null -> "Local changes are safe; ${state.sync.pushError.userMessage()}"
+        state.sync.pullError != null && state.sync.uploadAckedThisTurn ->
+            "Changes synced, but refresh failed: ${state.sync.pullError.userMessage()}"
+        state.sync.pullError != null -> "Refresh failed: ${state.sync.pullError.userMessage()}"
+        state.sync.conflicts > 0 -> "${state.sync.conflicts} conflict(s) need your decision."
+        state.sync.failedCount > 0 -> "${state.sync.failedCount} change(s) stopped; retry them explicitly."
+        state.sync.phase == com.vstokke.memos.domain.SyncPhase.UPLOADING -> "Sending local changes now."
+        state.sync.phase == com.vstokke.memos.domain.SyncPhase.RECONCILING -> "$pendingLabel waiting. Checking the server now."
         state.sync.pending > 0 -> "$pendingLabel saved on this device."
         state.sync.lastSyncedAt != null -> "Last synced ${formatLocalMemoTime(state.sync.lastSyncedAt)}"
         else -> "Local cache is ready."
@@ -122,7 +131,7 @@ fun SettingsScreen(
                 } else {
                     "Send local changes and check the server"
                 },
-                enabled = !state.busy && !state.sync.signInRequired,
+                enabled = !state.sync.signInRequired,
                 onClick = onRefresh,
             )
             SettingsDivider()

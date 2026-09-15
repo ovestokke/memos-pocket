@@ -49,7 +49,21 @@ data class MainUiState(
 
 private data class FeedSelection(val archive: Boolean, val space: String?)
 
+private data class SavedMemo(
+    val name: String,
+    val revision: Long,
+    val desired: Memo,
+)
+
 private fun MainUiState.selection() = FeedSelection(archive, selectedSpace)
+
+private fun sameEditableFields(left: Memo, right: Memo): Boolean =
+    left.content == right.content && left.visibility == right.visibility &&
+        left.reminderTime == right.reminderTime && left.space == right.space
+
+private fun draftMatches(draft: EditorDraft?, base: Memo): Boolean =
+    draft != null && draft.content == base.content && draft.visibility == base.visibility &&
+        draft.reminder == (base.reminderTime?.toString() ?: "") && draft.space == base.space
 
 class MainViewModel(private val repository: MemoRepository) : ViewModel() {
     private val defaultSelection = FeedSelection(archive = false, space = null)
@@ -58,6 +72,8 @@ class MainViewModel(private val repository: MemoRepository) : ViewModel() {
     private val pageHasMore = mutableMapOf(defaultSelection to repository.hasMore.value)
     private var repositorySelection = defaultSelection
     private var feedEmissionTarget: FeedSelection? = null
+    private var savedMemo: SavedMemo? = null
+    private var savedReminderWarning: String? = null
     private var pendingPage: FeedSelection? = null
     private val mutableState = MutableStateFlow(
         MainUiState(
@@ -70,7 +86,43 @@ class MainViewModel(private val repository: MemoRepository) : ViewModel() {
 
     init {
         viewModelScope.launch { repository.syncState.collect { sync -> mutableState.update { it.copy(sync = sync) } } }
-        viewModelScope.launch { repository.syncIssues.collect { issues -> mutableState.update { it.copy(syncIssues = issues) } } }
+        viewModelScope.launch {
+            repository.syncIssues.collect { issues ->
+                mutableState.update { it.copy(syncIssues = issues) }
+                refreshSavedNotice()
+            }
+        }
+        // Feed collection is selection-scoped; this account-scoped stream also updates an open
+        // archived/space detail when an ACK or deletion is not present in the selected feed.
+        repository.localMemos?.let { localFlow ->
+            viewModelScope.launch {
+                localFlow.collect { memos ->
+                    val current = mutableState.value
+                    val detail = current.detail
+                    val detailMemo = detail?.let { selected ->
+                        val pendingDelete = repository.syncIssues.value.any {
+                            it.desired.name == selected.name && it.deleted
+                        }
+                        if (pendingDelete) null else memos.firstOrNull { it.name == selected.name }
+                    }
+                    val draft = current.draft
+                    val base = draft?.base
+                    val currentBase = base?.let { old -> memos.firstOrNull { it.name == old.name } }
+                    val draftMatchesBase = base != null && draftMatches(draft, base)
+                    val divergence = base != null && currentBase == null
+                    mutableState.update {
+                        it.copy(
+                            detail = if (detail == null) null else detailMemo,
+                            draft = if (draftMatchesBase && currentBase != null) draft.copy(base = currentBase) else draft,
+                            conflict = it.conflict || divergence ||
+                                (base != null && currentBase != null && !draftMatchesBase &&
+                                    !sameEditableFields(base, currentBase)),
+                        )
+                    }
+                    refreshSavedNotice()
+                }
+            }
+        }
         viewModelScope.launch {
             repository.feed.collect { feed ->
                 val target = feedEmissionTarget ?: repositorySelection
@@ -107,6 +159,33 @@ class MainViewModel(private val repository: MemoRepository) : ViewModel() {
             requestPage(initialSelection)
             repository.scheduleSync()
         }
+    }
+
+    private fun refreshSavedNotice() {
+        val target = savedMemo ?: return
+        val localFlow = repository.localMemos
+        val local = localFlow?.value?.firstOrNull { it.name == target.name }
+        // Older repository fakes do not expose the all-local stream. They cannot prove an ACK,
+        // so retain the conservative waiting notice rather than claiming online/enqueued means synced.
+        if (localFlow != null && local == null) {
+            mutableState.update { it.copy(notice = null) }
+            return
+        }
+        val memo = local ?: target.desired
+        if (!sameEditableFields(target.desired, memo)) {
+            mutableState.update { it.copy(notice = null) }
+            return
+        }
+        val issue = mutableState.value.syncIssues.firstOrNull { it.desired.name == target.name }
+        val notice = savedReminderWarning ?: when {
+            issue?.status == MemoSyncStatus.FAILED -> "Saved locally. Sync is stopped for this memo; review Settings."
+            issue?.status == MemoSyncStatus.CONFLICT -> "Saved locally. Sync conflict; review Settings."
+            issue?.status == MemoSyncStatus.PENDING -> "Saved locally. Waiting to sync."
+            localFlow == null -> "Saved locally. Waiting to sync."
+            memo.syncStatus == MemoSyncStatus.SYNCED -> "Saved and synced."
+            else -> "Saved locally. Waiting to sync."
+        }
+        mutableState.update { it.copy(notice = notice) }
     }
 
     private fun runOperation(
@@ -199,7 +278,7 @@ class MainViewModel(private val repository: MemoRepository) : ViewModel() {
         repository.scheduleSync()
     }
 
-    fun refresh() = repository.scheduleSync()
+    fun refresh() = repository.requestManualSync()
 
     fun requestSignIn() {
         mutableState.update { it.copy(reauthenticating = true, signInBaseUrl = null, signInOptions = null) }
@@ -311,14 +390,32 @@ class MainViewModel(private val repository: MemoRepository) : ViewModel() {
                 memo = repository.edit(account, draft.base, MemoEdit(draft.content, draft.visibility, reminder))
                 preserved = memo.reminderTime == reminder
             }
-            mutableState.update { it.copy(draft = null, detail = if (draft.base == null) null else memo,
-                notice = when {
-                    !preserved -> "Saved, but the server did not preserve the reminder. Check Settings; delivery is not confirmed."
-                    memo.syncStatus == MemoSyncStatus.FAILED -> "Saved locally. Sync is stopped for this memo; review Settings."
-                    else -> "Saved locally. Waiting to sync."
-                }) }
+            val issue = repository.syncIssues.value.firstOrNull { it.desired.name == memo.name }
+            savedMemo = SavedMemo(memo.name, issue?.revision ?: -1L, memo)
+            savedReminderWarning = if (!preserved) {
+                "Saved, but the server did not preserve the reminder. Check Settings; delivery is not confirmed."
+            } else null
+            mutableState.update { it.copy(draft = null, detail = if (draft.base == null) null else memo) }
+            // The ACK can race this continuation; derive the notice from the current local state
+            // instead of assuming that the returned memo is still pending.
+            refreshSavedNotice()
         }
     }
+    fun toggleTask(memo: Memo, ref: TaskRef, checked: Boolean) {
+        val account = state.value.account ?: return
+        if (state.value.busy || memo.creator != account.userName || memo.state == "ARCHIVED" ||
+            memo.syncStatus == MemoSyncStatus.CONFLICT
+        ) return
+        runOperation(showProgress = false) {
+            val content = replaceTaskMarker(memo.content, ref, checked)
+                ?: throw AppException(AppError.Conflict)
+            val updated = repository.editContent(account, memo, content)
+            mutableState.update { current ->
+                current.copy(detail = if (current.detail?.name == memo.name) updated else current.detail)
+            }
+        }
+    }
+
     fun action(memo: Memo, action: String) {
         val account = state.value.account ?: return
         runOperation {

@@ -121,7 +121,7 @@ class MainActivity : ComponentActivity() {
                 val observer = LifecycleEventObserver { _, event ->
                     if (event == Lifecycle.Event.ON_RESUME) {
                         permissionRevision++
-                        viewModel.refresh()
+                        container.syncCoordinator.onForeground()
                         if (container.repository.account()?.supportsMemoReminderTime == true) {
                             lifecycleScope.launch(Dispatchers.IO) {
                                 container.reminders.processDueAndSchedule()

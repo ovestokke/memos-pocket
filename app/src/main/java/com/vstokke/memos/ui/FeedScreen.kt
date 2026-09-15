@@ -65,6 +65,7 @@ fun FeedScreen(
     onAction: (Memo, String) -> Unit,
     onMore: () -> Unit,
     selectedMemoName: String? = null,
+    onToggleTask: (Memo, TaskRef, Boolean) -> Unit = { _, _, _ -> },
 ) {
     androidx.compose.foundation.lazy.LazyColumn(
         Modifier.fillMaxSize(),
@@ -101,6 +102,7 @@ fun FeedScreen(
                 onOpen = onOpen,
                 onEdit = onEdit,
                 onAction = onAction,
+                onToggleTask = onToggleTask,
             )
             if (index != state.feed.lastIndex) {
                 HorizontalDivider(
@@ -150,6 +152,7 @@ private fun MemoRow(
     onOpen: (String) -> Unit,
     onEdit: (Memo) -> Unit,
     onAction: (Memo, String) -> Unit,
+    onToggleTask: (Memo, TaskRef, Boolean) -> Unit,
 ) {
     Surface(
         onClick = { onOpen(memo.name) },
@@ -164,7 +167,12 @@ private fun MemoRow(
         ) {
             MemoHeader(memo, account, busy, onEdit, onAction)
             Box(Modifier.fillMaxWidth().padding(end = 12.dp)) {
-                MarkdownText(memo.content.take(1800))
+                MarkdownText(
+                    markdown = memo.content,
+                    onTaskToggle = { task, checked -> onToggleTask(memo, task, checked) },
+                    taskEnabled = memo.creator == account.userName && memo.state != "ARCHIVED" &&
+                        memo.syncStatus != MemoSyncStatus.CONFLICT && !busy,
+                )
             }
             memo.reminderTime?.let {
                 Row(
@@ -195,6 +203,7 @@ fun MemoDetailScreen(
     busy: Boolean,
     onEdit: (Memo) -> Unit,
     onAction: (Memo, String) -> Unit,
+    onToggleTask: (Memo, TaskRef, Boolean) -> Unit = { _, _, _ -> },
 ) {
     Column(
         Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal = 24.dp, vertical = 16.dp),
@@ -202,7 +211,14 @@ fun MemoDetailScreen(
     ) {
         MemoHeader(memo, account, busy, onEdit, onAction)
         HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
-        SelectionContainer { MarkdownText(memo.content) }
+        SelectionContainer {
+            MarkdownText(
+                markdown = memo.content,
+                onTaskToggle = { task, checked -> onToggleTask(memo, task, checked) },
+                taskEnabled = memo.creator == account.userName && memo.state != "ARCHIVED" &&
+                    memo.syncStatus != MemoSyncStatus.CONFLICT && !busy,
+            )
+        }
         memo.reminderTime?.let {
             Row(
                 horizontalArrangement = Arrangement.spacedBy(8.dp),

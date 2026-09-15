@@ -62,6 +62,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.unit.dp
 import com.vstokke.memos.domain.MemoSyncStatus
+import com.vstokke.memos.domain.SyncPhase
 import com.vstokke.memos.domain.Space
 
 private data class AppDestination(val label: String, val icon: ImageVector)
@@ -207,7 +208,7 @@ fun MemosPocketScreen(
                             },
                             actions = {
                                 if (state.draft?.base == null && state.detail == null && destination != "Settings") {
-                                    IconButton(onClick = model::refresh, enabled = !state.busy) {
+                                    IconButton(onClick = model::refresh, enabled = !state.sync.signInRequired) {
                                         Icon(Icons.Outlined.Refresh, contentDescription = "Refresh memos")
                                     }
                                 }
@@ -233,6 +234,12 @@ fun MemosPocketScreen(
                             state.sync.signInRequired -> "Sign-in required. Local memos and changes are safe. Open Settings to sign in."
                             state.syncIssues.any { it.status == MemoSyncStatus.CONFLICT } -> "Sync conflict. Both versions are kept. Resolve in Settings."
                             state.syncIssues.any { it.status == MemoSyncStatus.FAILED } -> "Some changes could not sync. Review them in Settings."
+                            state.sync.pushError != null -> "Local changes could not sync: ${state.sync.pushError.userMessage()}"
+                            state.sync.pullError != null && state.sync.uploadAckedThisTurn ->
+                                "Changes synced, but refresh failed: ${state.sync.pullError.userMessage()}"
+                            state.sync.pullError != null -> "Refresh failed: ${state.sync.pullError.userMessage()}"
+                            state.sync.phase == SyncPhase.UPLOADING -> "Sending local changes…"
+                            state.sync.phase == SyncPhase.RECONCILING -> "Checking the server…"
                             state.sync.failed -> "Server unavailable. You can keep writing offline."
                             state.sync.pending > 0 -> "${state.sync.pending} changes saved locally · Waiting to sync"
                             state.sync.incomplete -> "Cache limit reached. Some older memos are unavailable offline."
@@ -309,6 +316,7 @@ fun MemosPocketScreen(
                                         model::action,
                                         { model.page(state.archive, true) },
                                         selectedMemoName = state.detail?.name,
+                                        onToggleTask = model::toggleTask,
                                     )
                                 }
                                 VerticalDivider(color = MaterialTheme.colorScheme.outlineVariant)
@@ -319,6 +327,7 @@ fun MemosPocketScreen(
                                         state.busy,
                                         model::beginEdit,
                                         model::action,
+                                        model::toggleTask,
                                     )
                                 }
                             }
@@ -330,6 +339,7 @@ fun MemosPocketScreen(
                                     state.busy,
                                     model::beginEdit,
                                     model::action,
+                                    model::toggleTask,
                                 )
                             }
 
@@ -342,6 +352,7 @@ fun MemosPocketScreen(
                                     model::beginEdit,
                                     model::action,
                                     { model.page(state.archive, true) },
+                                    onToggleTask = model::toggleTask,
                                 )
                             }
                         }

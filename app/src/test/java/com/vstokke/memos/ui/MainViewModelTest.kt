@@ -12,6 +12,8 @@ import org.junit.Before
 import org.junit.Test
 import org.mockito.Mockito.*
 import java.time.Instant
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 
 @OptIn(ExperimentalCoroutinesApi::class)
 class MainViewModelTest {
@@ -22,6 +24,7 @@ class MainViewModelTest {
     private val summary = MutableStateFlow<AccountSummary?>(account.summary())
     private val spaces = MutableStateFlow<List<Space>?>(emptyList())
     private val memo = Memo("memos/one", "Server", "Server", "PRIVATE", Instant.EPOCH, null, null, creator = "users/alice")
+    private fun <T> anyValue(): T = any<T>()
     @Before fun setup() {
         Dispatchers.setMain(dispatcher)
         `when`(repository.account()).thenReturn(account)
@@ -44,6 +47,44 @@ class MainViewModelTest {
         assertNull(model.state.value.draft)
         assertNull(model.state.value.detail)
         assertEquals("Saved locally. Waiting to sync.", model.state.value.notice)
+    }
+
+    @Test fun `ack arriving before save continuation reports synced rather than waiting`() = runTest(dispatcher) {
+        val local = MutableStateFlow<List<Memo>>(emptyList())
+        val issues = MutableStateFlow<List<com.vstokke.memos.data.PendingMemo>>(emptyList())
+        `when`(repository.localMemos).thenReturn(local)
+        `when`(repository.syncIssues).thenReturn(issues)
+        val created = memo.copy(content = "New thought", snippet = "New thought")
+        `when`(repository.create(account.summary(), NewMemo("New thought", null, "PRIVATE"))).thenAnswer {
+            local.value = listOf(created.copy(syncStatus = MemoSyncStatus.PENDING))
+            issues.value = listOf(com.vstokke.memos.data.PendingMemo(
+                created, null, false, 1L, null, false, MemoSyncStatus.PENDING, null,
+            ))
+            // Simulate the coordinator ACK before create() returns to the ViewModel.
+            local.value = listOf(created.copy(syncStatus = MemoSyncStatus.SYNCED))
+            issues.value = emptyList()
+            CreatedMemoResult(created.copy(syncStatus = MemoSyncStatus.PENDING), true)
+        }
+
+        val model = MainViewModel(repository)
+        model.updateDraft(EditorDraft(null, "New thought", "PRIVATE", ""))
+        model.save(); advanceUntilIdle()
+
+        assertEquals("Saved and synced.", model.state.value.notice)
+    }
+
+    @Test fun `ack or deletion outside selected feed closes open detail`() = runTest(dispatcher) {
+        val local = MutableStateFlow(listOf(memo))
+        `when`(repository.localMemos).thenReturn(local)
+        `when`(repository.get(account.summary(), memo.name)).thenReturn(memo)
+
+        val model = MainViewModel(repository)
+        model.open(memo.name); advanceUntilIdle()
+        assertEquals(memo, model.state.value.detail)
+
+        local.value = emptyList()
+        advanceUntilIdle()
+        assertNull(model.state.value.detail)
     }
 
     @Test fun `failed save keeps exact draft and base for retry`() = runTest(dispatcher) {
@@ -130,6 +171,89 @@ class MainViewModelTest {
         assertEquals("tomorrow", model.state.value.draft!!.reminder)
         assertTrue(model.state.value.error!!.contains("timezone"))
     }
+    @Test fun `task toggle uses content-only repository mutation and updates detail`() = runTest(dispatcher) {
+        `when`(repository.refresh()).thenReturn(account)
+        val task = memo.copy(content = "- [ ] Buy milk", snippet = "- [ ] Buy milk")
+        val ref = findTasks(task.content).single()
+        val updated = task.copy(content = "- [x] Buy milk", snippet = "- [x] Buy milk")
+        `when`(repository.editContent(account.summary(), task, updated.content)).thenReturn(updated)
+        `when`(repository.get(account.summary(), task.name)).thenReturn(task)
+
+        val model = MainViewModel(repository)
+        model.open(task.name)
+        advanceUntilIdle()
+        model.toggleTask(task, ref, checked = true)
+        advanceUntilIdle()
+
+        verify(repository).editContent(account.summary(), task, updated.content)
+        assertEquals(updated, model.state.value.detail)
+        assertNull(model.state.value.error)
+    }
+
+    @Test fun `rapid duplicate task taps do not double write while first mutation is suspended`() = runTest(dispatcher) {
+        val task = memo.copy(content = "- [ ] Buy milk", snippet = "- [ ] Buy milk")
+        val ref = findTasks(task.content).single()
+        val updated = task.copy(content = "- [x] Buy milk", snippet = "- [x] Buy milk")
+        val entered = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        `when`(repository.get(account.summary(), task.name)).thenReturn(task)
+        doAnswer {
+            entered.countDown()
+            check(release.await(5, TimeUnit.SECONDS))
+            updated
+        }.`when`(repository).editContent(anyValue(), anyValue(), anyValue())
+
+        val model = MainViewModel(repository)
+        model.open(task.name)
+        advanceUntilIdle()
+        assertEquals(task, model.state.value.detail)
+        Dispatchers.setMain(Dispatchers.Default)
+        model.toggleTask(task, ref, checked = true)
+        assertTrue(entered.await(5, TimeUnit.SECONDS))
+        assertTrue(model.state.value.busy)
+
+        // This is the stale second tap delivered while the first local mutation is in flight.
+        model.toggleTask(task, ref, checked = false)
+        verify(repository, times(1)).editContent(account.summary(), task, updated.content)
+
+        release.countDown()
+        waitUntil { !model.state.value.busy && model.state.value.detail == updated }
+        assertEquals(updated, model.state.value.detail)
+    }
+
+    @Test fun `read-only task toggle is ignored before repository mutation`() = runTest(dispatcher) {
+        `when`(repository.refresh()).thenReturn(account)
+        val other = memo.copy(creator = "users/bob", content = "- [ ] Other task")
+        val archived = memo.copy(state = "ARCHIVED", content = "- [ ] Archived task")
+        val model = MainViewModel(repository)
+
+        model.toggleTask(other, findTasks(other.content).single(), checked = true)
+        model.toggleTask(archived, findTasks(archived.content).single(), checked = true)
+        advanceUntilIdle()
+
+        verify(repository, never()).editContent(anyValue(), anyValue(), anyValue())
+        assertNull(model.state.value.error)
+    }
+
+    @Test fun `stale task toggle reports conflict without blind repository write`() = runTest(dispatcher) {
+        `when`(repository.refresh()).thenReturn(account)
+        val task = memo.copy(content = "- [ ] Buy milk")
+        val ref = findTasks(task.content).single()
+        val model = MainViewModel(repository)
+
+        model.toggleTask(task, ref.copy(checked = true), checked = true)
+        advanceUntilIdle()
+
+        verify(repository, never()).editContent(anyValue(), anyValue(), anyValue())
+        assertTrue(model.state.value.error!!.contains("changed", ignoreCase = true))
+    }
+
+    private fun waitUntil(condition: () -> Boolean) {
+        val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5)
+        while (!condition() && System.nanoTime() < deadline) Thread.sleep(1)
+        assertTrue("Timed out waiting for ViewModel operation", condition())
+    }
+
     @Test fun `conflict keeps draft until explicit server reload`() = runTest(dispatcher) {
         `when`(repository.refresh()).thenReturn(account)
         val edit = MemoEdit("Draft", "PRIVATE", null)

@@ -86,6 +86,43 @@ class MemosApiTest {
     }
 
     @Test
+    fun `refresh 401 is classified as refresh rejection rather than resource auth`() {
+        server.enqueue(MockResponse().setResponseCode(401).setBody("refresh rejected"))
+
+        val error = runCatching {
+            api.refreshSession(server.url("/").toString().trimEnd('/'), "refresh-one")
+        }.exceptionOrNull() as AppException
+
+        assertEquals(AppError.SessionRefreshRejected, error.error)
+    }
+
+    @Test
+    fun `malformed refresh response is invalid response rather than authentication`() {
+        server.enqueue(
+            MockResponse()
+                .addHeader("Set-Cookie", "memos_refresh=refresh-two; Path=/; HttpOnly")
+                .setBody("""{"accessToken":"","expiresAt":"not-a-time"}"""),
+        )
+
+        val error = runCatching {
+            api.refreshSession(server.url("/").toString().trimEnd('/'), "refresh-one")
+        }.exceptionOrNull() as AppException
+
+        assertEquals(AppError.InvalidResponse, error.error)
+    }
+
+    @Test
+    fun `refresh 403 remains permission and is not treated as revoked refresh`() {
+        server.enqueue(MockResponse().setResponseCode(403))
+
+        val error = runCatching {
+            api.refreshSession(server.url("/").toString().trimEnd('/'), "refresh-one")
+        }.exceptionOrNull() as AppException
+
+        assertEquals(AppError.Permission, error.error)
+    }
+
+    @Test
     fun `sso sign in accepts grpc gateway cookie and sends provider code verifier and native redirect`() {
         server.enqueue(
             MockResponse()

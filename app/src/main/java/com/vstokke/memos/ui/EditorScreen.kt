@@ -14,6 +14,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.outlined.Checklist
 import androidx.compose.material.icons.outlined.ContentCopy
 import androidx.compose.material.icons.outlined.Lock
 import androidx.compose.material3.Button
@@ -22,6 +23,7 @@ import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
@@ -29,6 +31,7 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -36,6 +39,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.text.input.TextFieldValue
 
 @Composable
 fun EditorScreen(
@@ -50,6 +54,32 @@ fun EditorScreen(
     val context = LocalContext.current
     var preview by remember { mutableStateOf(false) }
     var visibilityMenu by remember { mutableStateOf(false) }
+    var editorValue by remember(draft.base?.name) { mutableStateOf(TextFieldValue(draft.content)) }
+
+    LaunchedEffect(draft.content) {
+        if (editorValue.text != draft.content) {
+            editorValue = TextFieldValue(draft.content)
+        }
+    }
+
+    fun updateEditor(next: TextFieldValue) {
+        val continued = MarkdownEditorOps.continueTask(editorValue, next)
+        editorValue = continued
+        onChange(draft.copy(content = continued.text))
+    }
+
+    fun insertTask() {
+        val inserted = MarkdownEditorOps.insertTask(editorValue)
+        editorValue = inserted
+        onChange(draft.copy(content = inserted.text))
+    }
+
+    fun togglePreviewTask(ref: TaskRef, checked: Boolean) {
+        if (busy) return
+        val updated = MarkdownEditorOps.replaceTask(editorValue, ref, checked) ?: return
+        editorValue = updated
+        onChange(draft.copy(content = updated.text))
+    }
 
     Column(
         Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal = 16.dp, vertical = 8.dp),
@@ -83,7 +113,10 @@ fun EditorScreen(
                 }
             }
 
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
+                IconButton(onClick = ::insertTask, enabled = !busy) {
+                    Icon(Icons.Outlined.Checklist, contentDescription = "Insert task")
+                }
                 FilterChip(
                     selected = !preview,
                     onClick = { preview = false },
@@ -104,13 +137,17 @@ fun EditorScreen(
                 modifier = Modifier.fillMaxWidth().heightIn(min = 320.dp),
             ) {
                 Box(Modifier.padding(16.dp)) {
-                    MarkdownText(draft.content)
+                    MarkdownText(
+                        markdown = draft.content,
+                        onTaskToggle = ::togglePreviewTask,
+                        taskEnabled = !busy,
+                    )
                 }
             }
         } else {
             OutlinedTextField(
-                value = draft.content,
-                onValueChange = { onChange(draft.copy(content = it)) },
+                value = editorValue,
+                onValueChange = ::updateEditor,
                 enabled = !busy,
                 modifier = Modifier.fillMaxWidth().heightIn(min = 320.dp),
                 label = { Text("Memo") },

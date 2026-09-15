@@ -12,7 +12,21 @@ import com.vstokke.memos.domain.ReminderTime
 import java.time.Instant
 import java.util.UUID
 
-class AppDatabase(context: Context, databaseName: String = DATABASE_NAME) : SQLiteOpenHelper(context, databaseName, null, 3) {
+data class SyncFence(
+    val name: String,
+    val generation: Long,
+    val snapshot: Memo?,
+    val deleted: Boolean,
+)
+
+data class ScanSnapshot(
+    val touchGeneration: Long,
+    val fences: List<SyncFence>,
+    /** Set by the repository only after its resumable inventory cursor reaches the end. */
+    var inventoryComplete: Boolean = false,
+)
+
+class AppDatabase(context: Context, databaseName: String = DATABASE_NAME) : SQLiteOpenHelper(context, databaseName, null, 4) {
     override fun onCreate(database: SQLiteDatabase) {
         database.execSQL(
             """
@@ -66,6 +80,7 @@ class AppDatabase(context: Context, databaseName: String = DATABASE_NAME) : SQLi
             database.execSQL("ALTER TABLE feed_memos ADD COLUMN space TEXT")
         }
         if (oldVersion < 3) createOfflineTables(database)
+        if (oldVersion < 4) createSyncFenceTables(database)
     }
 
     private fun createOfflineTables(database: SQLiteDatabase) {
@@ -73,6 +88,12 @@ class AppDatabase(context: Context, databaseName: String = DATABASE_NAME) : SQLi
         database.execSQL("CREATE TABLE memo_outbox (name TEXT PRIMARY KEY NOT NULL, base TEXT, desired TEXT NOT NULL, deleted INTEGER NOT NULL, revision INTEGER NOT NULL, sent TEXT, sent_deleted INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL, server TEXT)")
         database.execSQL("CREATE TABLE offline_spaces (name TEXT PRIMARY KEY NOT NULL, title TEXT NOT NULL, description TEXT NOT NULL)")
         database.execSQL("CREATE TABLE sync_metadata (key TEXT PRIMARY KEY NOT NULL, value TEXT NOT NULL)")
+        createSyncFenceTables(database)
+    }
+
+    private fun createSyncFenceTables(database: SQLiteDatabase) {
+        database.execSQL("CREATE TABLE IF NOT EXISTS memo_sync_fences (name TEXT PRIMARY KEY NOT NULL, generation INTEGER NOT NULL, snapshot TEXT, deleted INTEGER NOT NULL)")
+        database.execSQL("CREATE TABLE IF NOT EXISTS memo_sync_touches (name TEXT PRIMARY KEY NOT NULL, generation INTEGER NOT NULL)")
     }
 
     fun replaceFeed(memos: List<Memo>) {
@@ -138,6 +159,23 @@ class AppDatabase(context: Context, databaseName: String = DATABASE_NAME) : SQLi
         ))
     } }
 
+    /** Captures the durable touch watermark and fences before a network scan begins. */
+    fun beginScan(): ScanSnapshot {
+        val touchGeneration = metadata(TOUCH_GENERATION)?.toLongOrNull() ?: 0L
+        return ScanSnapshot(touchGeneration, fences())
+    }
+
+    fun fences(): List<SyncFence> = readableDatabase.rawQuery(
+        "SELECT name, generation, snapshot, deleted FROM memo_sync_fences ORDER BY name", null,
+    ).use { cursor -> buildList {
+        while (cursor.moveToNext()) add(SyncFence(
+            name = cursor.getString(0),
+            generation = cursor.getLong(1),
+            snapshot = if (cursor.isNull(2)) null else MemoJson.decode(cursor.getString(2)),
+            deleted = cursor.getInt(3) != 0,
+        ))
+    } }
+
     fun localMemos(includeDeleted: Boolean = false): List<Memo> {
         val operations = pending().associateBy { it.desired.name }
         return feed().mapNotNull { memo ->
@@ -154,6 +192,7 @@ class AppDatabase(context: Context, databaseName: String = DATABASE_NAME) : SQLi
     // The desired view and its durable upload intent always commit together.
     fun queue(desired: Memo, base: Memo?, deleted: Boolean = false) {
         writableDatabase.transaction {
+            touch(desired.name)
             val old = pending().firstOrNull { it.desired.name == desired.name }
             if (deleted && old != null && old.base == null && old.sent == null) {
                 delete("memo_outbox", "name = ?", arrayOf(desired.name))
@@ -187,6 +226,12 @@ class AppDatabase(context: Context, databaseName: String = DATABASE_NAME) : SQLi
     fun acknowledge(operation: PendingMemo, server: Memo?) {
         writableDatabase.transaction {
             val current = pending().firstOrNull { it.desired.name == operation.desired.name } ?: return@transaction
+            // The fence and the ACK baseline are one transaction. A newer local revision keeps
+            // its desired view, while this server result remains durable protection from stale
+            // list pages during the next reconciliation.
+            touch(operation.desired.name)
+            upsertFence(operation.desired.name, server)
+            putMetadata("last_upload_ack", Instant.now().toString())
             if (current.revision == operation.revision) {
                 delete("memo_outbox", "name = ?", arrayOf(operation.desired.name))
                 if (server == null) delete("feed_memos", "name = ?", arrayOf(operation.desired.name)) else upsertMemo(server)
@@ -204,6 +249,7 @@ class AppDatabase(context: Context, databaseName: String = DATABASE_NAME) : SQLi
 
     fun resolve(name: String, copy: Memo?) {
         writableDatabase.transaction {
+            touch(name)
             val operation = pending().first { it.desired.name == name }
             require(operation.status == MemoSyncStatus.CONFLICT)
             delete("memo_outbox", "name = ?", arrayOf(name))
@@ -216,36 +262,101 @@ class AppDatabase(context: Context, databaseName: String = DATABASE_NAME) : SQLi
     fun retry(name: String): Boolean {
         val operation = pending().firstOrNull { it.desired.name == name } ?: return false
         if (operation.status != MemoSyncStatus.FAILED) return false
-        val values = ContentValues().apply {
-            put("status", MemoSyncStatus.PENDING)
-            // An unresolved create is never resent automatically. This explicit retry starts a new attempt.
-            if (operation.base == null) {
-                putNull("sent")
-                put("sent_deleted", 0)
+        return writableDatabase.transaction {
+            touch(name)
+            val values = ContentValues().apply {
+                put("status", MemoSyncStatus.PENDING)
+                // An unresolved create is never resent automatically. This explicit retry starts a new attempt.
+                if (operation.base == null) {
+                    putNull("sent")
+                    put("sent_deleted", 0)
+                }
             }
+            update("memo_outbox", values, "name = ? AND status = ?",
+                arrayOf(name, MemoSyncStatus.FAILED)) != 0
         }
-        return writableDatabase.update("memo_outbox", values, "name = ? AND status = ?",
-            arrayOf(name, MemoSyncStatus.FAILED)) != 0
     }
 
-    // Called only after all scopes/pages succeeded. Pending rows are never replaced or pruned.
+    // Complete scans are applied atomically; partial callers retain clean rows and spaces.
+    /** Compatibility overload for callers that do not participate in fence-aware scans. */
+    fun applyScan(memos: List<Memo>, spaces: List<Space>, byteLimit: Long,
+        incomplete: Boolean, pruneCandidates: Set<String>?) {
+        applyScan(memos, spaces, byteLimit, incomplete, pruneCandidates, null, emptyMap())
+    }
+
+    /**
+     * Applies only a complete scan. A scan snapshot is optional for old callers, but when
+     * present it gives ACK fences and local touches precedence over raw list data.
+     * [verifiedFences] contains entries proven by a matching list item or authoritative GET;
+     * null is meaningful and represents an authoritative deletion.
+     */
     fun applyScan(memos: List<Memo>, spaces: List<Space>, byteLimit: Long = 100L * 1024 * 1024,
-        incomplete: Boolean = false, pruneCandidates: Set<String>? = null) {
+        incomplete: Boolean = false, pruneCandidates: Set<String>? = null,
+        scan: ScanSnapshot? = null, verifiedFences: Map<String, Memo?> = emptyMap()) {
+        val inventoryComplete = scan?.inventoryComplete == true || !incomplete
         writableDatabase.transaction {
-            val protected = pending().map { it.desired.name }.toSet()
-            val confirmedDuringScan = if (pruneCandidates == null) emptyList() else
-                feed().filter { it.name !in pruneCandidates }
-            val clean = (confirmedDuringScan + memos).distinctBy { it.name }.filterNot { it.name in protected }
-            val retained = CacheBudget.retain(clean, byteLimit, localMemos(true).filter { it.name in protected })
-            feed().filterNot { it.name in protected }.forEach { delete("feed_memos", "name = ?", arrayOf(it.name)) }
+            val pendingNames = pending().map { it.desired.name }.toSet()
+            val touchedNames = scan?.let { touchedSince(it.touchGeneration) }.orEmpty()
+            val currentFences = fences().associateBy { it.name }
+            val capturedFences = scan?.fences?.associateBy { it.name }.orEmpty()
+            // Cache quota omission is distinct from an incomplete remote inventory. A complete
+            // inventory may replace/prune clean rows even when only a bounded subset fits cache.
+            val cleanExisting = when {
+                !inventoryComplete -> feed().filter { it.name !in pendingNames && it.name !in touchedNames }
+                pruneCandidates == null -> emptyList()
+                else -> feed().filter { it.name !in pruneCandidates }
+            }
+            val accepted = linkedMapOf<String, Memo>()
+            (cleanExisting + memos).forEach { memo ->
+                if (memo.name in pendingNames || memo.name in touchedNames) return@forEach
+                val fence = currentFences[memo.name]
+                val captured = capturedFences[memo.name]
+                if (fence != null) {
+                    val verified = verifiedFences.containsKey(memo.name) &&
+                        captured?.generation == fence.generation && memo.name !in touchedNames
+                    if (!verified) {
+                        if (!fence.deleted && fence.snapshot != null) accepted[memo.name] = fence.snapshot
+                        return@forEach
+                    }
+                    // A verified replacement is authoritative and may be newer than the ACK.
+                    if (verifiedFences[memo.name] != null) accepted[memo.name] = verifiedFences.getValue(memo.name)!!
+                    return@forEach
+                }
+                accepted[memo.name] = memo
+            }
+            verifiedFences.forEach { (name, memo) ->
+                if (name !in pendingNames && name !in touchedNames &&
+                    capturedFences[name]?.generation == currentFences[name]?.generation) {
+                    if (memo != null) accepted[name] = memo else accepted.remove(name)
+                }
+            }
+            val protected = pendingNames.mapNotNull { name -> feed().firstOrNull { it.name == name } }
+            val retained = CacheBudget.retain(accepted.values.toList(), byteLimit, protected)
+            if (inventoryComplete) {
+                feed().filter { it.name !in pendingNames && it.name !in touchedNames }
+                    .forEach { delete("feed_memos", "name = ?", arrayOf(it.name)) }
+            }
             retained.forEach { upsertMemo(it) }
-            delete("offline_spaces", null, null)
-            spaces.forEach { space -> insertOrThrow("offline_spaces", null, ContentValues().apply {
-                put("name", space.name); put("title", space.title); put("description", space.description)
-            }) }
-            setMetadata("incomplete", (incomplete || retained.size < clean.size).toString())
-            setMetadata("spaces_known", "true")
-            setMetadata("last_sync", Instant.now().toString())
+
+            if (scan != null && inventoryComplete) {
+                val afterTouches = touchedSince(scan.touchGeneration)
+                capturedFences.forEach { (name, captured) ->
+                    val current = fences().firstOrNull { it.name == name }
+                    if (current?.generation == captured.generation && name !in afterTouches &&
+                        name !in pendingNames && verifiedFences.containsKey(name)) {
+                        delete("memo_sync_fences", "name = ?", arrayOf(name))
+                    }
+                }
+            }
+            if (inventoryComplete) {
+                delete("offline_spaces", null, null)
+                spaces.forEach { space -> insertOrThrow("offline_spaces", null, ContentValues().apply {
+                    put("name", space.name); put("title", space.title); put("description", space.description)
+                }) }
+                setMetadata("spaces_known", "true")
+                setMetadata("last_sync", Instant.now().toString())
+            }
+            setMetadata("incomplete", (incomplete || retained.size < accepted.size).toString())
         }
     }
 
@@ -361,10 +472,44 @@ class AppDatabase(context: Context, databaseName: String = DATABASE_NAME) : SQLi
             delete("reminders", null, null)
             delete("reminder_deliveries", null, null)
             delete("memo_outbox", null, null)
+            delete("memo_sync_fences", null, null)
+            delete("memo_sync_touches", null, null)
             delete("offline_spaces", null, null)
             delete("sync_metadata", null, null)
         }
     }
+
+    private fun SQLiteDatabase.touch(name: String) {
+        val next = (queryMetadata(TOUCH_GENERATION)?.toLongOrNull() ?: 0L) + 1L
+        putMetadata(TOUCH_GENERATION, next.toString())
+        insertWithOnConflict("memo_sync_touches", null, ContentValues().apply {
+            put("name", name); put("generation", next)
+        }, SQLiteDatabase.CONFLICT_REPLACE)
+    }
+
+    private fun SQLiteDatabase.upsertFence(name: String, server: Memo?) {
+        val next = (queryMetadata(FENCE_GENERATION)?.toLongOrNull() ?: 0L) + 1L
+        putMetadata(FENCE_GENERATION, next.toString())
+        insertWithOnConflict("memo_sync_fences", null, ContentValues().apply {
+            put("name", name); put("generation", next)
+            server?.let { put("snapshot", MemoJson.encode(it)) } ?: putNull("snapshot")
+            put("deleted", if (server == null) 1 else 0)
+        }, SQLiteDatabase.CONFLICT_REPLACE)
+    }
+
+    private fun SQLiteDatabase.queryMetadata(key: String): String? = rawQuery(
+        "SELECT value FROM sync_metadata WHERE key = ?", arrayOf(key),
+    ).use { if (it.moveToFirst()) it.getString(0) else null }
+
+    private fun SQLiteDatabase.putMetadata(key: String, value: String) {
+        insertWithOnConflict("sync_metadata", null, ContentValues().apply {
+            put("key", key); put("value", value)
+        }, SQLiteDatabase.CONFLICT_REPLACE)
+    }
+
+    private fun SQLiteDatabase.touchedSince(generation: Long): Set<String> = rawQuery(
+        "SELECT name FROM memo_sync_touches WHERE generation > ?", arrayOf(generation.toString()),
+    ).use { cursor -> buildSet { while (cursor.moveToNext()) add(cursor.getString(0)) } }
 
     private fun Memo.toValues() = ContentValues().apply {
         put("snapshot", MemoJson.encode(this@toValues))
@@ -396,5 +541,7 @@ class AppDatabase(context: Context, databaseName: String = DATABASE_NAME) : SQLi
     private companion object {
         const val DATABASE_NAME = "memos-pocket.db"
         const val DELIVERY_RETENTION_SECONDS = 48L * 60L * 60L
+        const val TOUCH_GENERATION = "memo_touch_generation"
+        const val FENCE_GENERATION = "memo_fence_generation"
     }
 }

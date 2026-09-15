@@ -11,7 +11,9 @@ import com.vstokke.memos.data.MemoRepository
 import com.vstokke.memos.data.MemosApi
 import com.vstokke.memos.reminders.NotificationPublisher
 import com.vstokke.memos.reminders.ReminderCoordinator
+import com.vstokke.memos.work.SyncCoordinator
 import com.vstokke.memos.work.SyncScheduler
+import com.vstokke.memos.work.AndroidSyncConnectivity
 
 class MemosPocketApp : Application() {
     private val applicationScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -21,10 +23,10 @@ class MemosPocketApp : Application() {
 
     override fun onCreate() {
         super.onCreate()
-        container = AppContainer(this)
+        container = AppContainer(this, applicationScope)
         container.notifications.ensureChannel()
+        container.syncCoordinator.start()
         val account = container.repository.account()
-        if (account != null) container.syncScheduler.enqueueRepair()
         if (account?.supportsMemoReminderTime == true) {
             container.syncScheduler.ensurePeriodicSync()
             applicationScope.launch { container.reminders.processDueAndSchedule() }
@@ -35,17 +37,37 @@ class MemosPocketApp : Application() {
     }
 }
 
-class AppContainer(application: Application) {
+class AppContainer(
+    application: Application,
+    private val applicationScope: CoroutineScope,
+) {
     private val database = AppDatabase(application)
     private val credentials = CredentialStore(application)
     val notifications = NotificationPublisher(application)
     val reminders = ReminderCoordinator(application, database, notifications)
     val syncScheduler = SyncScheduler(application)
-    val repository = MemoRepository(
-        credentials = credentials,
-        database = database,
-        api = MemosApi(),
-        reminders = reminders,
-        syncScheduler = syncScheduler,
-    )
+    val syncCoordinator: SyncCoordinator
+    val repository: MemoRepository
+
+    init {
+        // The callback is captured before the coordinator is assigned, but cannot run until the
+        // fully constructed application exposes the repository to callers.
+        lateinit var coordinator: SyncCoordinator
+        repository = MemoRepository(
+            credentials = credentials,
+            database = database,
+            api = MemosApi(),
+            reminders = reminders,
+            syncScheduler = syncScheduler,
+            requestSync = { coordinator.requestLocalWrite() },
+            requestManualSyncCallback = { coordinator.requestManual() },
+        )
+        coordinator = SyncCoordinator(
+            repository = repository,
+            scheduler = syncScheduler,
+            connectivity = AndroidSyncConnectivity(application),
+            scope = applicationScope,
+        )
+        syncCoordinator = coordinator
+    }
 }

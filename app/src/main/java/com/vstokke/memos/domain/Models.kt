@@ -95,16 +95,31 @@ data class Memo(
     val syncStatus: String = MemoSyncStatus.SYNCED,
 )
 
+enum class SyncPhase { IDLE, UPLOADING, RECONCILING, WAITING_FOR_AUTH }
+
 data class SyncState(
     val syncing: Boolean = false,
     val signInRequired: Boolean = false,
     val failed: Boolean = false,
     val incomplete: Boolean = false,
     val pending: Int = 0,
+    val conflicts: Int = 0,
+    val failedCount: Int = 0,
     val lastSyncedAt: Instant? = null,
+    val phase: SyncPhase = SyncPhase.IDLE,
+    val pushError: AppError? = null,
+    val pullError: AppError? = null,
+    val lastUploadAckAt: Instant? = null,
+    val lastReconciledAt: Instant? = null,
+    /** Whether this bounded turn acknowledged at least one local mutation. */
+    val uploadAckedThisTurn: Boolean = false,
+    /** Whether this bounded turn completed remote inventory reconciliation. */
+    val reconciledThisTurn: Boolean = false,
 )
 
 data class MemoPage(val memos: List<Memo>, val nextPageToken: String?)
+
+data class SpacePage(val spaces: List<Space>, val nextPageToken: String?)
 
 data class Space(
     val name: String,
@@ -134,6 +149,12 @@ data class CreatedMemoResult(
 
 sealed class AppError {
     data object Authentication : AppError()
+    /** A resource rejected access after this sync exhausted its one recovery attempt. */
+    data object ResourceAuthentication : AppError()
+    /** The refresh endpoint rejected the persisted session credential. */
+    data object SessionRefreshRejected : AppError()
+    /** The device could not durably save the encrypted session credential. */
+    data object CredentialPersistence : AppError()
     data object InvalidCredentials : AppError()
     data object SignInFailed : AppError()
     data object Network : AppError()
@@ -147,7 +168,9 @@ sealed class AppError {
     fun userMessage(): String = when (this) {
         Conflict -> "This memo changed on the server. Your draft is kept. Reopen the memo to load the server version before editing again."
         Permission -> "You do not have permission for this action."
-        Authentication -> "Your session is no longer valid. Sign in again."
+        Authentication, SessionRefreshRejected -> "Your session is no longer valid. Sign in again."
+        ResourceAuthentication -> "The server rejected this access token. Sync will retry session recovery."
+        CredentialPersistence -> "The session could not be saved securely. Try again."
         InvalidCredentials -> "The username or password was not accepted."
         SignInFailed -> "Sign-in could not be completed. Try again."
         Network -> "Could not reach the Memos server. Check your connection and address."

@@ -12,6 +12,7 @@ import com.vstokke.memos.domain.NewMemo
 import com.vstokke.memos.domain.ReminderRecord
 import com.vstokke.memos.domain.ReminderTime
 import com.vstokke.memos.domain.Space
+import com.vstokke.memos.domain.SpacePage
 import com.vstokke.memos.domain.SignInOptions
 import com.vstokke.memos.domain.SignedInSession
 import com.vstokke.memos.domain.SessionTokens
@@ -122,10 +123,12 @@ class MemosApi(
             method = "POST",
             jsonBody = "{}",
             refreshToken = refreshToken,
+            refreshRequest = true,
         )
         return parseJson(response.body) { root ->
             SessionTokens(
-                accessToken = root.getString("accessToken"),
+                accessToken = root.getString("accessToken").takeIf { it.isNotBlank() }
+                    ?: throw JSONException("missing access token"),
                 accessTokenExpiresAt = Instant.parse(root.getString("expiresAt")),
                 refreshToken = response.refreshToken(baseUrl),
             )
@@ -152,30 +155,40 @@ class MemosApi(
         return parseJson(body) { root -> root.optBoolean("memoReminderTimeSupported", false) }
     }
 
+    /** Fetches exactly one space page so callers can bound a reconciliation turn. */
+    fun listSpacesPage(account: Account, pageToken: String? = null, pageSize: Int = 1_000): SpacePage {
+        require(pageSize in 1..1_000)
+        val url = endpoint(account.baseUrl, "api/v1/spaces").newBuilder()
+            .addQueryParameter("pageSize", pageSize.toString())
+            .apply { pageToken?.let { addQueryParameter("pageToken", it) } }
+            .build()
+        return parseJson(execute(account, url)) { root ->
+            val source = root.optJSONArray("spaces") ?: org.json.JSONArray()
+            val spaces = buildList(source.length()) {
+                for (index in 0 until source.length()) {
+                    val value = source.getJSONObject(index)
+                    val name = value.getString("name")
+                    if (!SPACE_NAME.matches(name)) throw JSONException("invalid space resource")
+                    add(Space(
+                        name = name,
+                        title = value.getString("title"),
+                        description = value.optString("description"),
+                    ))
+                }
+            }
+            SpacePage(spaces, root.optString("nextPageToken").ifBlank { null })
+        }
+    }
+
+    /** Compatibility convenience; reconciliation uses listSpacesPage for bounded work. */
     fun listSpaces(account: Account): List<Space> {
         val spaces = LinkedHashMap<String, Space>()
         val seenTokens = mutableSetOf<String>()
         var pageToken: String? = null
         do {
-            val url = endpoint(account.baseUrl, "api/v1/spaces").newBuilder()
-                .addQueryParameter("pageSize", "1000")
-                .apply { pageToken?.let { addQueryParameter("pageToken", it) } }
-                .build()
-            val body = execute(account, url)
-            pageToken = parseJson(body) { root ->
-                val source = root.optJSONArray("spaces") ?: org.json.JSONArray()
-                for (index in 0 until source.length()) {
-                    val value = source.getJSONObject(index)
-                    val name = value.getString("name")
-                    if (!SPACE_NAME.matches(name)) throw JSONException("invalid space resource")
-                    spaces[name] = Space(
-                        name = name,
-                        title = value.getString("title"),
-                        description = value.optString("description"),
-                    )
-                }
-                root.optString("nextPageToken").ifBlank { null }
-            }
+            val page = listSpacesPage(account, pageToken)
+            page.spaces.forEach { spaces[it.name] = it }
+            pageToken = page.nextPageToken
             if (pageToken != null && !seenTokens.add(pageToken!!)) {
                 throw AppException(AppError.InvalidResponse)
             }
@@ -366,6 +379,7 @@ class MemosApi(
         jsonBody: String? = null,
         token: String? = null,
         refreshToken: String? = null,
+        refreshRequest: Boolean = false,
         invalidCredentialsOnBadRequest: Boolean = false,
         signInRequest: Boolean = false,
     ): ApiResponse {
@@ -385,6 +399,7 @@ class MemosApi(
                     val error = when {
                         invalidCredentialsOnBadRequest && response.code == 400 -> AppError.InvalidCredentials
                         signInRequest -> AppError.SignInFailed
+                        refreshRequest && response.code == 401 -> AppError.SessionRefreshRejected
                         response.code == 401 -> AppError.Authentication
                         response.code == 403 -> AppError.Permission
                         else -> AppError.Server(response.code)
@@ -465,7 +480,9 @@ class MemosApi(
 
     private fun <T> parseJson(body: String, block: (JSONObject) -> T): T = try {
         block(JSONObject(body))
-    } catch (_: JSONException) {
+    } catch (error: AppException) {
+        throw error
+    } catch (_: Exception) {
         throw AppException(AppError.InvalidResponse)
     }
 
