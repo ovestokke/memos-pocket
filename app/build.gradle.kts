@@ -4,11 +4,11 @@ plugins {
     id("org.jetbrains.kotlin.plugin.compose")
 }
 
-val appVersionName = providers.environmentVariable("MEMOS_POCKET_VERSION_NAME").orElse("0.3.0")
+val appVersionName = providers.environmentVariable("MEMOS_POCKET_VERSION_NAME").orElse("0.4.0")
 val appVersionCode = providers.environmentVariable("MEMOS_POCKET_VERSION_CODE").map { value ->
     value.toIntOrNull()?.takeIf { it > 0 }
         ?: error("MEMOS_POCKET_VERSION_CODE must be a positive integer.")
-}.orElse(3000)
+}.orElse(4000)
 
 val releaseSigningValues = mapOf(
     "storeFile" to providers.environmentVariable("MEMOS_POCKET_STORE_FILE").orNull,
